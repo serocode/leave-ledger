@@ -108,17 +108,26 @@ matching employee (the name read off the scan is a starting point, not a
 guarantee) before hitting "Submit checked rows". A row flagged with a parse
 warning (e.g. an unreadable date) needs its dates filled in by hand.
 
-Schools lay this form out differently, so the reader recognises five column
-layouts (3, 5, 6, 7 and 9 columns) and picks whichever one a page matches. If
-a form's table matches none of them, the upload now says so outright instead
-of quietly coming back with zero rows.
+Schools lay this form out differently, so the reader **reads the table's own
+header row** and maps each column by what it is labelled — "NO. OF DAYS",
+"Date/s of Absence", "TYPE OF LEAVE", "Action Taken" and so on. A school that
+orders its columns differently, or leaves one out, needs no change here. One
+header spanning several columns (an "Employee Name" printed across Last /
+First / M.I.) is matched by position, which is how those three are
+recognised. Older fixed layouts (3, 5, 6, 7 and 9 columns) stay as a fallback
+for a page whose header can't be read, and a table that matches nothing at
+all says so outright rather than quietly coming back with zero rows.
 
-One of those layouts — the 6-column "Summary of Absences" transmittal
-(No./Name/Position/Date/s of Absence/Days/Remarks) — prints no leave type at
-all, only "w/ pay" or "w/o pay", so its rows are drafted as **sick leave**.
-That is what these transmittals are in practice and what this tool records,
-but it is an assumption: check the leave type shown on each row before
-submitting, and untick anything that was really another type.
+A transmittal with no Type of Leave column — one printing only "w/ pay" or
+"w/o pay" — has its rows drafted as **sick leave**. That is what these are in
+practice and what this tool records, but it is an assumption: check the leave
+type shown on each row before submitting, and untick anything that was really
+another type.
+
+**Only rows inside the table's printed borders can be read.** A row added by
+hand underneath the last ruled line is invisible to a grid-based reader (and
+handwriting is not OCR-able anyway), so it will not appear — count the rows
+against the paper and add any stragglers from the Individual Employee tab.
 
 Verified against a real Macanhan Elementary School Form 6 transmittal
 (2026-09-10, 19 employee rows): names, dates (including multi-day ranges),

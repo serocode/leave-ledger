@@ -175,9 +175,16 @@ def _find_cell_boxes(img: np.ndarray) -> list[tuple[int, int, int, int]]:
     for c in contours:
         x, y, ww, hh = cv2.boundingRect(c)
         area = ww * hh
-        if area < 1200 or area > 0.05 * (w * h):
+        if area < 1200 or ww < 20 or hh < 15:
             continue
-        if ww < 20 or hh < 15:
+        # What needs dropping here is the whole-table contour and any
+        # whole-row one, and those are recognisable by *spanning* the table
+        # rather than by covering some fixed share of its area. An area cap
+        # can't tell the two apart: on a short transmittal (a header and two
+        # data rows) every cell is legitimately a tenth of the table, so a
+        # cap tuned against a 20-row form silently dropped that form's three
+        # widest columns and left a 6-column table looking like a 3-column one.
+        if ww > 0.75 * w or hh > 0.75 * h:
             continue
         boxes.append((x, y, ww, hh))
     return _split_merged_rows(_drop_nested_boxes(boxes))
@@ -357,6 +364,85 @@ COLUMN_CONFIGS_7COL = [
     (6, _WORD_OR_CODE_WHITELIST),   # 5: Type of Leave
     (6, _WORD_OR_CODE_WHITELIST),   # 6: Remarks (action taken)
 ]
+
+
+# ---------------------------------------------------------------------------
+# Header-driven column mapping
+#
+# Matching a layout by how many columns it has does not survive contact with
+# real schools: Man-Ai and Masterson are both 6-column forms whose columns are
+# in a different order and mean different things, so a count alone read one
+# form's "2 days" as the other's Position. Every one of these transmittals
+# labels its columns, though — so read the header row and let it say which
+# column is which. A school that invents a new column order, or drops a
+# column, then needs no new template at all.
+#
+# Header cells are matched to data cells by horizontal overlap rather than by
+# index, because a header can span several data columns ("Employee Name" over
+# Last / First / M.I.) — that span is exactly how those three are recognised.
+# ---------------------------------------------------------------------------
+
+# (field, patterns) in priority order — the first field whose pattern appears
+# in a cleaned header wins, so "NO. OF DAYS" lands on days rather than on the
+# "NO." row-number column.
+_HEADER_FIELDS: list[tuple[str, tuple[str, ...]]] = [
+    ("last", ("LASTNAME", "SURNAME")),
+    ("first", ("FIRSTNAME", "GIVENNAME")),
+    ("days", ("DAY",)),
+    ("dates", ("DATE", "INCLUSIVE")),
+    ("type", ("TYPEOFLEAVE", "LEAVETYPE", "TYPE", "CAUSE", "KIND")),
+    ("action", ("ACTION", "REMARK", "STATUS")),
+    ("position", ("POSITION", "DESIGNATION")),
+    ("name", ("NAME", "PERSONNEL", "TEACHER", "EMPLOYEE")),
+    ("no", ("NO", "SEQ")),
+]
+
+
+def _header_field(raw: str) -> str | None:
+    """Fold one header cell's text down to a canonical field name."""
+    cleaned = re.sub(r"[^A-Za-z]", "", raw).upper()
+    if not cleaned:
+        return None
+    if cleaned in ("MI", "MIDDLEINITIAL") or "MIDDLE" in cleaned:
+        return "mi"
+    for field, patterns in _HEADER_FIELDS:
+        if any(p in cleaned for p in patterns):
+            return field
+    return None
+
+
+def _map_header_row(img: np.ndarray, header_boxes: list[tuple[int, int, int, int]]) -> dict[int, str] | None:
+    """Read a candidate header row. Returns {x-centre: field} or None when the
+    row doesn't look like a header at all."""
+    fields: dict[int, str] = {}
+    for box in header_boxes:
+        field = _header_field(_ocr_cell(img, box, 6, None))
+        if field:
+            fields[box[0]] = field
+    # A real header names at least a person and a date; anything less is a
+    # data row that happened to contain a word, and mapping against it would
+    # be worse than falling back to the fixed templates.
+    named = set(fields.values())
+    if not named & {"name", "last"} or not named & {"dates", "days"}:
+        return None
+    return fields
+
+
+def _fields_for_row(
+    header: dict[int, str], header_boxes: list[tuple[int, int, int, int]],
+    row_boxes: list[tuple[int, int, int, int]],
+) -> list[str | None]:
+    """Label each cell of a data row with the field of the header cell it sits
+    under — by overlap, so one wide header covers every column beneath it."""
+    labels: list[str | None] = []
+    for x, _, w, _ in row_boxes:
+        best, best_overlap = None, 0
+        for hx, _, hw, _ in header_boxes:
+            overlap = min(x + w, hx + hw) - max(x, hx)
+            if overlap > best_overlap:
+                best, best_overlap = header.get(hx), overlap
+        labels.append(best)
+    return labels
 
 
 def _ocr_cell(img: np.ndarray, box: tuple[int, int, int, int], psm: int, whitelist: str | None, pad: int = 4) -> str:
@@ -570,97 +656,56 @@ def _parse_date_segments_numeric(raw: str) -> tuple[list[tuple[date, date]], str
 _MONTH_NAME_TO_NUM = {name.lower(): i for i, name in enumerate(MONTH_NAMES) if name}
 
 
-def _parse_date_segments_monthname(
-    raw: str, default_year: int | None
-) -> tuple[list[tuple[date, date, float]], str | None]:
-    """Parse a "<Month> D[am|pm],D,D..." Inclusive Dates cell (seen on the
-    Lumbia Central School template — no numeric month, and a trailing
-    "am"/"pm" on a day marks it a half-day). Some rows spell out a trailing
-    ", <year>" (e.g. "June 26, 2026") even though most just rely on the
-    page header's year — either way the year itself is stripped before day
-    tokens are read, so it's never mistaken for two more days ("20", "26").
-
-    Consecutive calendar days are grouped into one contiguous (date_from,
-    date_to, used) run each; non-adjacent days become separate runs, e.g.
-    "June 8pm,9,10,11,22,23" -> [(Jun 8, Jun 11, 3.5), (Jun 22, Jun 23, 2.0)].
-    """
-    fail = ([], f"Could not parse dates from {raw!r} — enter manually.")
-    text = raw.strip()
-    # Anchor on the first month name rather than the start of the cell: the
-    # dates always begin at the month, so any leading characters are OCR
-    # noise (e.g. a descender bleeding down from the row above).
-    m = next(
-        (
-            mm
-            for mm in re.finditer(r"\b([A-Za-z]+)\b", text)
-            if mm.group(1).lower() in _MONTH_NAME_TO_NUM
-        ),
-        None,
-    )
-    if not m:
-        return fail
-    month = _MONTH_NAME_TO_NUM[m.group(1).lower()]
-    if default_year is None:
-        return [], f"Could not determine the year for {raw!r} — enter manually."
-
-    rest = text[m.end():]
-    year_m = re.search(r"\b(20\d{2})\b", rest)
-    if year_m:
-        rest = rest[: year_m.start()] + rest[year_m.end() :]
-
-    tokens = re.findall(r"(\d{1,2})\s*(am|pm)?", rest, re.IGNORECASE)
-    days = [(int(d), bool(half)) for d, half in tokens]
-    if not days:
-        return fail
-
-    runs: list[tuple[date, date, float]] = []
-    run_start = run_end = days[0][0]
-    run_half_count = 1 if days[0][1] else 0
-    run_len = 1
-    for day, is_half in days[1:]:
-        if day == run_end + 1:
-            run_end = day
-            run_len += 1
-            run_half_count += 1 if is_half else 0
-        else:
-            runs.append(_finish_run(month, default_year, run_start, run_end, run_len, run_half_count))
-            run_start = run_end = day
-            run_len = 1
-            run_half_count = 1 if is_half else 0
-    runs.append(_finish_run(month, default_year, run_start, run_end, run_len, run_half_count))
-
-    try:
-        return [(f, t, u) for f, t, u in runs], None
-    except ValueError:
-        return [], f"Invalid date parsed from {raw!r} — enter manually."
-
-
-_ABSENCE_TOKEN_RE = re.compile(
+_MONTHDAY_TOKEN_RE = re.compile(
     r"(?P<year>20\d{2})"
     r"|(?P<word>[A-Za-z]+)"
-    r"|(?P<d1>\d{1,2})\s*(?:\(\s*(?P<h1>am|pm)\s*\)?)?"
-    r"(?:\s*-\s*(?P<d2>\d{1,2})\s*(?:\(\s*(?P<h2>am|pm)\s*\)?)?)?",
+    r"|(?P<d1>\d{1,2})\s*(?:\(?\s*(?P<h1>am|pm)\s*\)?)?"
+    r"(?:\s*-\s*(?P<d2>\d{1,2})\s*(?:\(?\s*(?P<h2>am|pm)\s*\)?)?)?",
     re.IGNORECASE,
 )
 
 
-def _parse_date_segments_absence(
+def _disambiguate_ampersands(raw: str) -> str:
+    """Tell a separator "&" from a digit 8 misread as one.
+
+    The two glyphs are close enough that Tesseract swaps them freely, and a
+    date cell needs both: "July 1-3 & 6-7" joins two ranges, while "June
+    8pm,9,10" starts with an eight. Printed separators are spaced out on
+    every one of these forms, so an "&" with whitespace on both sides is a
+    separator and any other one is the digit it was misread from — without
+    this, one form loses a day off the front of a range and the other gains
+    a day that was never there.
+    """
+    return re.sub(
+        r"&",
+        lambda m: "&" if (
+            m.start() > 0 and raw[m.start() - 1].isspace()
+            and m.end() < len(raw) and raw[m.end()].isspace()
+        ) else "8",
+        raw,
+    )
+
+
+def _parse_date_segments_monthname(
     raw: str, default_year: int | None
 ) -> tuple[list[tuple[date, date, float]], str | None]:
-    """Parse a free-form "Date/s of Absence" cell (the Masterson ES
-    template): "June 30, 2026", "July 1-3 & 6-7, 2026", "June 29(pm), 2026",
+    """Parse any month-name date cell. Every school writes these a little
+    differently and one parser covers all of it: "June 26, 2026",
+    "June 8pm,9,10,11,22,23", "July 1-3 & 6-7, 2026", "June 29(pm), 2026",
     "June 30, 2026; July 2(pm), 2026".
 
-    Unlike the other month-name parser this one tracks the month as it scans,
-    so a cell may span more than one, and it expands "D-D" ranges rather than
-    reading their endpoints as two separate days. The year is usually printed
-    *after* the days it belongs to, so days are held pending until a year
-    token arrives (falling back to the page header's year at the end).
+    The month is tracked as the cell is scanned, so one cell may span more
+    than one; "D-D" ranges are expanded rather than read as their two
+    endpoints; and a half-day marker counts whether or not it is bracketed
+    ("19pm" and "19(pm)" alike). The year is usually printed *after* the days
+    it belongs to, so days are held pending until a year token arrives,
+    falling back to the page header's year at the end.
 
     Consecutive calendar days become one contiguous (date_from, date_to,
-    used) run each, with an "(am)"/"(pm)" day counting as half.
+    used) run each, an am/pm day counting as half.
     """
     fail = ([], f"Could not parse dates from {raw!r} — enter manually.")
+    raw = _disambiguate_ampersands(raw)
     month: int | None = None
     pending: list[tuple[int, int, bool]] = []  # (month, day, is_half), year not yet known
     dated: list[tuple[date, bool]] = []
@@ -674,7 +719,7 @@ def _parse_date_segments_absence(
         pending.clear()
         return True
 
-    for m in _ABSENCE_TOKEN_RE.finditer(raw):
+    for m in _MONTHDAY_TOKEN_RE.finditer(raw):
         if m.group("year"):
             if not _flush(int(m.group("year"))):
                 return [], f"Invalid date parsed from {raw!r} — enter manually."
@@ -716,10 +761,6 @@ def _parse_date_segments_absence(
             used = 0.5 if is_half else 1.0
     runs.append((start, end, used))
     return runs, None
-
-
-def _finish_run(month: int, year: int, start_day: int, end_day: int, length: int, half_count: int) -> tuple[date, date, float]:
-    return date(year, month, start_day), date(year, month, end_day), length - 0.5 * half_count
 
 
 _HALF_WORD_RE = re.compile(r"half", re.IGNORECASE)
@@ -1008,6 +1049,125 @@ def _rows_from_segments(
     return rows
 
 
+def _ocr_date_cell(img: np.ndarray, box: tuple[int, int, int, int]) -> str:
+    """A mapped date column can hold either style — "06/30/2026" or
+    "June 30, 2026" — so read it with the month-name whitelist first, then
+    re-read a numeric cell under the tight digits-and-slashes one it was
+    tuned for. A numeric cell read this way comes back without its slashes
+    ("06302026"), which is still enough to tell the two styles apart."""
+    raw = _ocr_cell(img, box, 6, _ABSENCE_DATES_WHITELIST)
+    if _MONTH_IN_TEXT_RE.search(raw):
+        return raw
+    # No month name: a numeric cell, whose slashes the first whitelist can't
+    # even represent ("06/17/2026" comes back "06172026"). Read it again
+    # under the digits-and-slashes whitelist that style was tuned for.
+    return _ocr_cell(img, box, 6, _DATE_WHITELIST)
+
+
+_MONTH_IN_TEXT_RE = re.compile(
+    r"\b(" + "|".join(MONTH_NAMES[1:]) + r"|" + "|".join(m[:3] for m in MONTH_NAMES[1:]) + r")",
+    re.IGNORECASE,
+)
+
+
+def _extract_mapped_row(
+    img: np.ndarray, row_boxes: list[tuple[int, int, int, int]],
+    labels: list[str | None], default_year: int | None, seq: int,
+) -> list[Form6Row]:
+    """Read one data row using the header's own column labels, whatever order
+    the school chose to print them in."""
+    cells: dict[str, list[tuple[str, tuple[int, int, int, int]]]] = {}
+    for label, box in zip(labels, row_boxes):
+        if label:
+            cells.setdefault(label, []).append(("", box))
+
+    def read(field: str, psm: int, whitelist: str | None, index: int = 0) -> str:
+        entries = cells.get(field) or []
+        if index >= len(entries):
+            return ""
+        return _ocr_cell(img, entries[index][1], psm, whitelist).strip()
+
+    # One "name" header spanning three columns is how Last / First / M.I. are
+    # recognised; a single one holds "Last, First M.I." all together.
+    name_cells = cells.get("name") or []
+    if cells.get("last"):
+        last_name = _clean_name_part(read("last", 6, None)).title()
+        first_name = _clean_name_part(read("first", 6, None)).title()
+        middle_initial = _normalize_mi(read("mi", 6, _MI_WHITELIST))
+    elif len(name_cells) >= 3:
+        last_name = _clean_name_part(read("name", 6, None, 0)).title()
+        first_name = _clean_name_part(read("name", 6, None, 1)).title()
+        middle_initial = _normalize_mi(read("name", 6, _MI_WHITELIST, 2))
+    else:
+        name_raw = read("name", 6, None)
+        # Some templates put the row number inside the name cell ("1. Cruz, J.").
+        m = re.match(r"^\s*(\d{1,2})[.)]\s*(.+)$", name_raw)
+        if m:
+            name_raw = m.group(2)
+        last_name, first_name, middle_initial = _split_combined_name(name_raw)
+
+    if not last_name or (not first_name and "," not in (last_name or "")):
+        # Header remnants, a section label ("TEACHING PERSONNEL:"), a blank
+        # row — anything without a readable person on it.
+        return []
+
+    has_dates_col = bool(cells.get("dates"))
+    days_raw = (
+        read("days", 6, _COMBINED_DATES_WHITELIST) if not has_dates_col
+        else read("days", 7, None)
+    )
+    dates_raw = _ocr_date_cell(img, cells["dates"][0][1]) if has_dates_col else days_raw
+
+    leave_type = _normalize_leave_type(read("type", 6, _WORD_OR_CODE_WHITELIST))
+    action_taken = _normalize_action(read("action", 6, _WORD_OR_CODE_WHITELIST))
+    if not leave_type and "-" in (raw_action := read("action", 6, _WORD_OR_CODE_WHITELIST)):
+        # A single Remarks column can carry both, combined ("SL-WP").
+        leave_type, action_taken = _split_combined_remarks(raw_action)
+    if leave_type not in _LEAVE_TYPE_LABELS:
+        if action_taken not in ("WP", "WOP"):
+            # Neither column says anything a leave form would say — this is
+            # some other table that happens to have people's names in it.
+            return []
+        # A form with no Type column at all (it prints only "w/ pay") — see
+        # the note in the README: these are recorded as sick leave, which is
+        # what they are in practice, and stay visible for review.
+        leave_type = "SL"
+
+    used_override: float | None
+    if has_dates_col:
+        if _MONTH_IN_TEXT_RE.search(dates_raw):
+            runs, warning = _parse_date_segments_monthname(dates_raw, default_year)
+            segments, per_run_used = [(f, t) for f, t, _ in runs], [u for _, _, u in runs]
+        else:
+            segments, warning = _parse_date_segments_numeric(dates_raw)
+            per_run_used = []
+        used_override = _normalize_total_days(days_raw)
+    else:
+        runs, used_override, warning = _parse_date_segments_combined(days_raw)
+        segments, per_run_used = [(f, t) for f, t, _ in runs], [u for _, _, u in runs]
+
+    row_no = _normalize_digits(read("no", 7, None))
+    if not row_no.isdigit():
+        row_no = str(seq)
+
+    return _rows_from_segments(
+        row_no=row_no,
+        last_name=last_name,
+        first_name=first_name,
+        middle_initial=middle_initial,
+        position_raw=_normalize_position(read("position", 7, None)),
+        dates_raw=dates_raw,
+        days_raw=days_raw,
+        leave_type=leave_type,
+        action_taken=action_taken,
+        in_scope=(leave_type == "SL" and action_taken in ("WP", "WOP")),
+        segments=segments,
+        total_override=used_override,
+        unparsed_warning=warning,
+        default_used=per_run_used or None,
+    )
+
+
 def _extract_9col_row(img: np.ndarray, row_boxes: list[tuple[int, int, int, int]]) -> list[Form6Row]:
     """The original bordered 9-column layout (No./Last/First/M.I./Position/
     Dates/Days/Type/Action) — also matches the Bongbongon Elementary
@@ -1171,7 +1331,7 @@ def _extract_6col_row(
     last_name, first_name, middle_initial = _split_combined_name(name_raw)
     dates_raw = raw_values[3].strip()
     days_raw = raw_values[4].strip()
-    segments, warning = _parse_date_segments_absence(dates_raw, default_year)
+    segments, warning = _parse_date_segments_monthname(dates_raw, default_year)
 
     return _rows_from_segments(
         row_no=row_no,
@@ -1252,23 +1412,44 @@ def _load_pages(path: str) -> list[np.ndarray]:
     return [img]
 
 
-def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int, Counter[int]]:
+def _extract_page(
+    img: np.ndarray, seq_start: int, header: tuple[dict[int, str], list[tuple[int, int, int, int]]] | None = None
+) -> tuple[list[Form6Row], int, Counter[int], tuple[dict[int, str], list[tuple[int, int, int, int]]] | None]:
     """Run the full per-page pipeline (table detection through row
     extraction) on one page image. Returns (rows, next seq_start, counts of
-    rows whose column count matched no template) — seq is
-    the running row-number counter for the row-number-less 5-column layout,
-    threaded across pages so numbering stays continuous in a multi-page PDF."""
+    rows no layout could read, the header mapping to carry forward) — seq is
+    the running row-number counter for layouts with no row-number column,
+    threaded across pages so numbering stays continuous in a multi-page PDF.
+
+    `header` is the mapping read from an earlier page: a continuation page of
+    a long transmittal usually repeats the table but not its header row, so
+    the one already found keeps being used."""
     default_year = _detect_default_year(img)
     warped = _dewarp_table(img)
     boxes = _find_cell_boxes(warped)
-    grouped = _group_into_rows(boxes)
+    grouped = [sorted(row, key=lambda b: b[0]) for row in _group_into_rows(boxes)]
+
+    # Read the column labels off the form itself. Only the first few rows are
+    # considered — a header is at the top, and a data row that happens to
+    # contain a word shouldn't be mistaken for one further down.
+    for candidate in grouped[:3]:
+        mapping = _map_header_row(warped, candidate)
+        if mapping:
+            header = (mapping, candidate)
+            break
 
     results: list[Form6Row] = []
     seq = seq_start
     unmatched: Counter[int] = Counter()
     for row_boxes in grouped:
-        row_boxes = sorted(row_boxes, key=lambda b: b[0])
-        if len(row_boxes) == len(COLUMN_CONFIGS):
+        if header:
+            labels = _fields_for_row(header[0], header[1], row_boxes)
+            seq += 1
+            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq)
+        # No readable header (a cropped photo, a table with no header row on
+        # this page): fall back to recognising the handful of layouts this
+        # tool knew before headers were read, purely by column count.
+        elif len(row_boxes) == len(COLUMN_CONFIGS):
             row_results = _extract_9col_row(warped, row_boxes)
         elif len(row_boxes) == len(COLUMN_CONFIGS_7COL):
             seq += 1
@@ -1287,15 +1468,13 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
         if row_results:
             results.extend(row_results)
         elif len(row_boxes) > 1:
-            # Either a column layout no template covers, or one that matched
-            # a template by column count but that the template then rejected
-            # (a header row, or a different DepEd form that happens to have
-            # the same number of columns). Counted either way so the caller
-            # can say so instead of silently reporting "0 rows" — it is only
-            # ever read when the whole document yielded nothing.
+            # A row nothing could read: an unlabelled layout, a header row, or
+            # a different DepEd form that happens to be a table of names.
+            # Counted so the caller can say so instead of silently reporting
+            # "0 rows" — only ever read when the document yielded nothing.
             unmatched[len(row_boxes)] += 1
 
-    return results, seq, unmatched
+    return results, seq, unmatched, header
 
 
 def extract_form6(image_path: str) -> list[Form6Row]:
@@ -1318,11 +1497,12 @@ def extract_form6(image_path: str) -> list[Form6Row]:
 
     results: list[Form6Row] = []
     seq = 0
+    header = None
     errors: list[str] = []
     unmatched: Counter[int] = Counter()
     for i, img in enumerate(pages, start=1):
         try:
-            page_results, seq, page_unmatched = _extract_page(img, seq)
+            page_results, seq, page_unmatched, header = _extract_page(img, seq, header)
             unmatched.update(page_unmatched)
         except ValueError as e:
             # A page with no detectable table (e.g. a PDF cover/signature
