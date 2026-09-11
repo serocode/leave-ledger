@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+
+# Real Form 6 scans name actual teachers alongside their leave dates and
+# without-pay status. Keep them off the repo — this one is public.
+samples/
+
+# Local design exports and working notes.
+Design/
+HANDOFF.md
+PROJECT-CHECKLIST.md
