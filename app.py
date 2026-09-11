@@ -322,6 +322,65 @@ PAGE = """
               padding: 9px 12px; font-size: 0.8125rem; color: var(--text-body); }
   .err { color: var(--err-text); }
   .loading { color: var(--text-muted); font-style: italic; }
+
+  /* A Form 6 upload runs two slow steps back to back — OCR on the scan, then
+     one HRIS search per name — and both used to sit behind a single static
+     line of text, which reads as a hung app. The spinner shows the step is
+     alive; the bar is a real count of names checked during matching (the
+     long step), and only falls back to an indeterminate sweep for OCR, where
+     there is no progress to report. */
+  .busy { display: flex; align-items: center; gap: 8px; font-size: 0.8125rem;
+          color: var(--text-body); }
+  .busy-count { margin-left: auto; flex: none; font-variant-numeric: tabular-nums;
+                color: var(--text-muted); }
+  .spinner { width: 13px; height: 13px; flex: none; border-radius: 50%;
+             border: 2px solid var(--line); border-top-color: var(--navy);
+             animation: spin 0.7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress.indeterminate > div { width: 34%; transition: none;
+                                  animation: sweep 1.2s ease-in-out infinite; }
+  @keyframes sweep { from { margin-left: -34%; } to { margin-left: 100%; } }
+  /* Rows resolve a few at a time, so a settling flash is what makes the
+     progress visible on the table itself, not just in the status line. */
+  @keyframes settle { from { background: var(--ok-bg); } to { background: transparent; } }
+  #form6Table tbody tr.just-matched td { animation: settle 1.2s ease-out; }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner { animation-duration: 2.4s; }
+    .progress.indeterminate > div { animation: none; width: 100%; opacity: 0.4; }
+    #form6Table tbody tr.just-matched td { animation: none; }
+  }
+
+  /* A spinner sitting inside a filled button or on a coloured row needs its
+     track lightened, or the ring reads as a solid dot. */
+  .spinner-sm { width: 11px; height: 11px; border-width: 2px; }
+  .primary .spinner, .accent .spinner { border-color: rgba(255,255,255,0.35);
+                                        border-top-color: #fff; }
+  .row-status .spinner, .loading .spinner { vertical-align: -1px; margin-right: 5px;
+                                            display: inline-block; }
+
+  /* ---- Confirmation modal ----
+     These confirmations are the last thing standing between a mis-typed day
+     count and a real HRIS record, so they show the actual values being
+     written rather than native confirm()'s wall of text — which can't show
+     structure, can't be styled, and which browsers let a user suppress for
+     the rest of the session ("don't ask again"). <dialog> is used so Esc,
+     focus trapping and the inert backdrop come from the platform. */
+  dialog.modal { border: 1px solid var(--line); border-radius: var(--r-lg); padding: 0;
+                 background: var(--surface); color: var(--text-body); box-shadow: var(--e2);
+                 width: min(460px, calc(100vw - 2rem)); }
+  dialog.modal::backdrop { background: rgba(15, 23, 42, 0.45); }
+  .modal-body { padding: 1.1rem 1.25rem 0; }
+  .modal-body h3 { font-size: 1rem; margin: 0 0 0.35rem; color: var(--text); }
+  .modal-intro { font-size: 0.8125rem; color: var(--text-body); margin: 0 0 0.75rem; }
+  .modal-rows { margin: 0 0 0.85rem; display: grid; grid-template-columns: auto minmax(0, 1fr);
+                gap: 5px 12px; font-size: 0.8125rem; border-top: 1px solid var(--line);
+                padding-top: 0.75rem; }
+  .modal-rows dt { color: var(--text-muted); }
+  .modal-rows dd { margin: 0; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px;
+                   padding: 0.9rem 1.25rem 1.1rem; }
+  @media (max-width: 480px) { .modal-actions { flex-direction: column-reverse; }
+                              .modal-actions button { width: 100%; justify-content: center; } }
   .session-banner { background: var(--err-bg); border: 1px solid var(--err-line); color: var(--err-text);
                     padding: 11px 14px; border-radius: var(--r); font-size: 0.875rem;
                     margin-bottom: 1rem; text-align: center; display: none; }
@@ -463,6 +522,10 @@ PAGE = """
     <p class="sub">A photo or scan (JPG/PNG) or a multi-page PDF. It is read into a
     draft table for you to review and correct — nothing reaches HRIS until you submit.
     Sick-leave rows (with or without pay) are pre-checked.</p>
+    <p class="sub" style="margin-bottom:0.85rem"><b>Count the rows against the paper.</b>
+    Only rows inside the table's printed borders can be read — a row written in by hand
+    below the last line is invisible to the reader and will not appear here. Add those
+    from the Individual Employee tab.</p>
     <div class="field-row" style="align-items:flex-end">
       <div style="flex:2"><input type="file" id="form6File" accept="image/*,application/pdf"></div>
       <div style="flex:none"><button id="form6Upload" type="button" class="primary">Read Form 6</button></div>
@@ -748,13 +811,14 @@ async function checkedFetch(url, options) {
 
 let searchTimeout = null;
 let selectedEmpId = null;
+let selectedEmpName = '';
 
 document.getElementById('q').addEventListener('input', (e) => {
   clearTimeout(searchTimeout);
   const q = e.target.value.trim();
   const box = document.getElementById('results');
   if (q.length < 2) { box.innerHTML = ''; return; }
-  box.innerHTML = '<div class="loading">Searching...</div>';
+  box.innerHTML = '<div class="loading">' + busyText('Searching...') + '</div>';
   searchTimeout = setTimeout(async () => {
     try {
       const res = await checkedFetch('/api/search?q=' + encodeURIComponent(q));
@@ -778,6 +842,7 @@ const EMP_METRICS = ['empEarned', 'empUsed', 'empBalance', 'empWop'];
 
 async function selectEmployee(emp) {
   selectedEmpId = emp.id;
+  selectedEmpName = emp.full_name;
   document.getElementById('results').innerHTML = '';
   document.getElementById('q').value = emp.full_name;
   document.getElementById('employeeCard').style.display = 'block';
@@ -825,13 +890,107 @@ async function selectEmployee(emp) {
   }
 }
 
+// ----- Confirmation modal -----
+// Replaces confirm()/alert() on every path that writes to HRIS. Beyond
+// looking like the rest of the app, it can lay the values out as a table —
+// and it can't be switched off the way a browser's native dialog can, which
+// matters when it is the only thing between a typo and a real record.
+
+let _modalEl = null;
+
+function _modal() {
+  if (_modalEl) return _modalEl;
+  _modalEl = document.createElement('dialog');
+  _modalEl.className = 'modal';
+  _modalEl.innerHTML =
+    '<form method="dialog">' +
+      '<div class="modal-body">' +
+        '<h3></h3><p class="modal-intro"></p><dl class="modal-rows"></dl>' +
+        '<div class="modal-note"></div>' +
+      '</div>' +
+      '<div class="modal-actions">' +
+        '<button type="submit" value="cancel" class="modal-cancel"></button>' +
+        '<button type="submit" value="ok" class="primary modal-ok"></button>' +
+      '</div>' +
+    '</form>';
+  document.body.appendChild(_modalEl);
+  return _modalEl;
+}
+
+function escapeHtml(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// rows: [[label, value], ...]. note: an optional warn box under them.
+// Resolves true only on the confirm button — Esc, the backdrop and Cancel
+// all resolve false, so a dismissed dialog can never be read as a yes.
+function confirmModal({ title, intro = '', rows = [], note = '', confirmText = 'Continue', cancelText = 'Cancel' }) {
+  const el = _modal();
+  el.querySelector('h3').textContent = title;
+  const introEl = el.querySelector('.modal-intro');
+  introEl.textContent = intro;
+  introEl.style.display = intro ? 'block' : 'none';
+  const rowsEl = el.querySelector('.modal-rows');
+  rowsEl.innerHTML = rows
+    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`)
+    .join('');
+  rowsEl.style.display = rows.length ? 'grid' : 'none';
+  const noteEl = el.querySelector('.modal-note');
+  noteEl.innerHTML = note ? `<div class="warn-box">${escapeHtml(note)}</div>` : '';
+  const cancelBtn = el.querySelector('.modal-cancel');
+  const okBtn = el.querySelector('.modal-ok');
+  cancelBtn.textContent = cancelText;
+  cancelBtn.style.display = cancelText ? 'inline-flex' : 'none';
+  okBtn.textContent = confirmText;
+
+  return new Promise(resolve => {
+    el.addEventListener('close', () => resolve(el.returnValue === 'ok'), { once: true });
+    el.showModal();
+    // Cancel takes focus, not the confirming button: the safe option should
+    // be the one a stray Enter lands on.
+    (cancelText ? cancelBtn : okBtn).focus();
+  });
+}
+
+// A modal in place of alert() — one button, nothing to decide.
+function alertModal(title, intro) {
+  return confirmModal({ title, intro, confirmText: 'OK', cancelText: '' });
+}
+
+// ----- Button load states -----
+// A disabled button that only changes its label still looks like nothing is
+// happening on a slow HRIS call; a spinner in the button says which action
+// is the one in flight.
+function setBtnBusy(btn, label) {
+  if (btn.dataset.idleHtml === undefined) btn.dataset.idleHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+  btn.innerHTML = '<span class="spinner spinner-sm"></span>' + escapeHtml(label);
+}
+
+function clearBtnBusy(btn, label) {
+  btn.disabled = false;
+  btn.removeAttribute('aria-busy');
+  if (label !== undefined) { btn.textContent = label; btn.dataset.idleHtml = label; }
+  else if (btn.dataset.idleHtml !== undefined) btn.innerHTML = btn.dataset.idleHtml;
+}
+
+function busyText(label) {
+  return '<span class="spinner spinner-sm"></span>' + escapeHtml(label);
+}
+
 // ----- Add record -----
 
 const SUBMIT_ENABLED = {{ 'true' if submit_enabled else 'false' }};
 
 document.getElementById('addForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (!selectedEmpId) { alert('Pick an employee first'); return; }
+  if (!selectedEmpId) {
+    alertModal('Pick an employee first', 'Search for an employee and select them before adding a record.');
+    return;
+  }
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
   body.employee_id = selectedEmpId;
@@ -844,15 +1003,21 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
   if (isNaN(usedVal) || usedVal <= 0) { showError('addResult', 'Used must be a positive number.'); return; }
 
   if (SUBMIT_ENABLED) {
-    const column = body.without_pay ? 'without pay' : 'used';
-    const summary = `${body.description || '(no description)'}\\n` +
-      `${body.date_from || '?'} to ${body.date_to || '?'}, ${column}: ${body.used}\\n\\n` +
-      `This will write a real record to HRIS for this employee. Continue?`;
-    if (!confirm(summary)) return;
+    const ok = await confirmModal({
+      title: 'Write this record to HRIS?',
+      rows: [
+        ['Employee', selectedEmpName || ('HRIS ID #' + selectedEmpId)],
+        ['Description', body.description || '(none)'],
+        ['Dates', body.date_from + ' to ' + body.date_to],
+        [body.without_pay ? 'Without pay' : 'Used', body.used + ' day(s)'],
+      ],
+      note: 'This writes a real record to HRIS. It cannot be undone from this tool.',
+      confirmText: 'Write record',
+    });
+    if (!ok) return;
   }
   const btn = document.getElementById('addSubmitBtn');
-  btn.disabled = true;
-  btn.textContent = 'Submitting...';
+  setBtnBusy(btn, 'Submitting...');
   document.getElementById('addResult').innerHTML = '';
   try {
     const res = await checkedFetch('/api/add', {
@@ -873,8 +1038,7 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
   } catch (err) {
     if (err.message !== 'Session expired') showError('addResult', 'Submission failed — check your connection and try again.');
   } finally {
-    btn.disabled = false;
-    btn.textContent = SUBMIT_ENABLED ? 'Submit to HRIS' : 'Preview payload (dry run)';
+    clearBtnBusy(btn, SUBMIT_ENABLED ? 'Submit to HRIS' : 'Preview payload (dry run)');
   }
 });
 
@@ -883,25 +1047,61 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
 // ---------------------------------------------------------------------
 let form6Rows = []; // {draft, employeeId, employeeName}
 
+// Drives the status line under the upload button during the two slow steps.
+// Returns a small handle so the caller can move the bar along and then
+// replace the whole panel with a one-line result.
+function form6Busy(target, label, total) {
+  const determinate = typeof total === 'number';
+  target.innerHTML =
+    '<div class="busy"><span class="spinner"></span>' +
+    '<span class="busy-label"></span><span class="busy-count"></span></div>' +
+    '<div class="progress' + (determinate ? '' : ' indeterminate') + '"><div></div></div>';
+  const labelEl = target.querySelector('.busy-label');
+  const countEl = target.querySelector('.busy-count');
+  const barEl = target.querySelector('.progress > div');
+  const started = Date.now();
+
+  // With no progress to report (OCR), a ticking elapsed time is what tells
+  // the user the app is still working rather than stuck.
+  const tick = determinate ? null : setInterval(() => {
+    countEl.textContent = Math.round((Date.now() - started) / 1000) + 's';
+  }, 1000);
+
+  labelEl.textContent = label;
+  return {
+    step(done, text) {
+      if (text) labelEl.textContent = text;
+      if (!determinate) return;
+      countEl.textContent = done + ' / ' + total;
+      barEl.style.width = (total ? (done / total) * 100 : 0) + '%';
+    },
+    done(text) {
+      if (tick) clearInterval(tick);
+      target.textContent = text;
+    },
+  };
+}
+
 document.getElementById('form6Upload').addEventListener('click', async () => {
   const fileInput = document.getElementById('form6File');
   const status = document.getElementById('form6Status');
   const uploadBtn = document.getElementById('form6Upload');
   if (!fileInput.files.length) { status.textContent = 'Choose an image first.'; return; }
-  status.innerHTML = '<span class="loading">Reading Form 6 — this can take a few seconds...</span>';
+  const busy = form6Busy(status, 'Reading the scan — dewarping the page and OCR-ing each cell...');
   uploadBtn.disabled = true;
   const fd = new FormData();
   fd.append('file', fileInput.files[0]);
   try {
     const res = await checkedFetch('/api/ocr', { method: 'POST', body: fd });
     const data = await res.json();
-    if (data.error) { status.textContent = 'Error: ' + data.error; return; }
+    if (data.error) { busy.done('Error: ' + data.error); return; }
     form6Rows = data.rows.map(r => ({ draft: r, employeeId: null, employeeName: '' }));
-    status.textContent = `Read ${form6Rows.length} row(s). Looking up employees...`;
+    busy.done('');
     renderForm6Table();
     await autoMatchForm6Rows(status);
   } catch (err) {
-    if (err.message !== 'Session expired') status.textContent = 'Upload failed: ' + err;
+    if (err.message !== 'Session expired') busy.done('Upload failed: ' + err);
+    else busy.done('');
   } finally {
     uploadBtn.disabled = false;
   }
@@ -1020,42 +1220,73 @@ function form6NameGuess(d) {
 // exactly one employee is matched automatically; anything ambiguous or
 // unfound is left for the user, with its candidates already on screen so
 // picking one is a single click rather than a search.
+// The slow half of an upload: one HRIS search per distinct name, dozens of
+// them, previously sent as a single request that sat silent until the whole
+// batch came back. Names now go up in small groups so the bar can move on
+// real progress and matched rows can settle into the table as they land —
+// and so a failure part-way keeps everything already matched.
+const FORM6_MATCH_CHUNK = 4;
+
 async function autoMatchForm6Rows(status) {
-  const names = form6Rows.map(r => form6NameGuess(r.draft));
-  let matches;
-  try {
-    const res = await checkedFetch('/api/match', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ names }),
-    });
-    const data = await res.json();
-    if (data.error) { status.textContent = 'Employee lookup failed: ' + data.error; return; }
-    matches = data.matches || {};
-  } catch (err) {
-    if (err.message !== 'Session expired') {
-      status.textContent = `Read ${form6Rows.length} row(s), but the employee lookup failed — use Find on each row.`;
+  const names = [...new Set(form6Rows.map(r => form6NameGuess(r.draft)))];
+  const busy = form6Busy(status, `Matching ${names.length} name(s) against HRIS...`, names.length);
+
+  let checked = 0;
+  let auto = 0;
+  let failed = 0;
+  for (let i = 0; i < names.length; i += FORM6_MATCH_CHUNK) {
+    const chunk = names.slice(i, i + FORM6_MATCH_CHUNK);
+    let matches = {};
+    try {
+      const res = await checkedFetch('/api/match', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ names: chunk }),
+      });
+      const data = await res.json();
+      if (data.error) { failed += chunk.length; } else { matches = data.matches || {}; }
+    } catch (err) {
+      if (err.message === 'Session expired') { busy.done(''); return; }
+      failed += chunk.length;
     }
-    return;
+
+    auto += applyForm6Matches(matches);
+    checked += chunk.length;
+    busy.step(checked, `Matching names against HRIS — ${auto} linked so far...`);
   }
 
+  const left = form6Rows.filter(r => r.draft.in_scope && !r.employeeId).length;
+  busy.done(
+    `Read ${form6Rows.length} row(s). Matched ${auto} automatically` +
+    (left ? ` — ${left} still need a pick below.` : '. Review before submitting.') +
+    (failed ? ` (${failed} name(s) couldn't be looked up — use Find on those rows.)` : '')
+  );
+  updateForm6Summary();
+}
+
+// Fold one chunk's results into the rows they belong to and update just
+// those rows in place — a full re-render would throw away any edit or tick
+// the user has already made further down the table while this runs.
+function applyForm6Matches(matches) {
   let auto = 0;
-  form6Rows.forEach(row => {
-    const found = (matches[form6NameGuess(row.draft)] || {}).results || [];
+  form6RowEls().forEach(tr => {
+    const row = form6Rows[tr.dataset.idx];
+    const found = (matches[form6NameGuess(row.draft)] || {}).results;
+    if (!found) return;
     row.candidates = found;
     if (found.length === 1) {
       row.employeeId = found[0].id;
       row.employeeName = found[0].full_name;
       row.autoMatched = true;
       auto++;
+      tr.classList.add('just-matched');
+      setTimeout(() => tr.classList.remove('just-matched'), 1300);
     }
+    setMatchState(tr, row);
+    if (!row.employeeName) showMatchOptions(tr, Number(tr.dataset.idx), found);
   });
-
-  renderForm6Table();
-  const left = form6Rows.filter(r => r.draft.in_scope && !r.employeeId).length;
-  status.textContent =
-    `Read ${form6Rows.length} row(s). Matched ${auto} automatically` +
-    (left ? ` — ${left} still need a pick below.` : '. Review before submitting.');
+  updateForm6Summary();
+  return auto;
 }
 
 function renderForm6Table() {
@@ -1132,7 +1363,7 @@ function renderForm6Table() {
       const q = tr.querySelector('.match-input').value.trim();
       const resultsBox = tr.querySelector('.match-results');
       if (q.length < 2) return;
-      resultsBox.innerHTML = '<div class="loading">Searching...</div>';
+      resultsBox.innerHTML = '<div class="loading">' + busyText('Searching...') + '</div>';
       try {
         const res = await checkedFetch('/api/search?q=' + encodeURIComponent(q));
         const data = await res.json();
@@ -1204,7 +1435,9 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
     }));
   if (!rows.length) { status.textContent = 'No matched without-pay rows to check.'; return; }
 
-  status.innerHTML = '<span class="loading">Checking ' + rows.length + ' row(s)...</span>';
+  const auditBtn = document.getElementById('wopAudit');
+  setBtnBusy(auditBtn, 'Checking...');
+  const busy = form6Busy(status, `Checking ${rows.length} row(s) against each ledger...`);
   tbody.innerHTML = '';
   let records;
   try {
@@ -1214,20 +1447,22 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
       body: JSON.stringify({ rows }),
     });
     const data = await res.json();
-    if (data.error) { status.textContent = 'Check failed: ' + data.error; return; }
+    if (data.error) { busy.done('Check failed: ' + data.error); return; }
     records = data.records || [];
   } catch (err) {
-    if (err.message !== 'Session expired') status.textContent = 'Check failed: ' + err;
+    busy.done(err.message === 'Session expired' ? '' : 'Check failed: ' + err);
     return;
+  } finally {
+    clearBtnBusy(auditBtn);
   }
 
   if (!records.length) {
     table.style.display = 'none';
-    status.textContent = 'Nothing to fix — no without-pay row is sitting in "used".';
+    busy.done('Nothing to fix — no without-pay row is sitting in "used".');
     return;
   }
 
-  status.textContent = `${records.length} record(s) recorded as paid leave. Fix them one at a time, checking HRIS after the first.`;
+  busy.done(`${records.length} record(s) recorded as paid leave. Fix them one at a time, checking HRIS after the first.`);
   table.style.display = 'table';
   records.forEach(rec => {
     const tr = document.createElement('tr');
@@ -1242,13 +1477,22 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
     const btn = tr.querySelector('.wop-fix');
     const cell = tr.querySelector('.row-status');
     btn.addEventListener('click', async () => {
-      if (SUBMIT_ENABLED && !confirm(
-        `Record #${rec.record_id} for ${rec.employee_name || rec.employee_id}\\n` +
-        `${rec.description}\\n\\n` +
-        `Move ${rec.used} day(s) from "used" to "without pay"? This edits a real HRIS record.`
-      )) return;
-      btn.disabled = true;
-      cell.textContent = 'Saving...';
+      if (SUBMIT_ENABLED) {
+        const ok = await confirmModal({
+          title: 'Move these days to without pay?',
+          rows: [
+            ['Employee', rec.employee_name || ('HRIS ID #' + rec.employee_id)],
+            ['Record', '#' + rec.record_id],
+            ['Description', rec.description],
+            ['Days to move', rec.used + ' day(s), used \u2192 without pay'],
+          ],
+          note: 'This edits a real HRIS record.',
+          confirmText: 'Move days',
+        });
+        if (!ok) return;
+      }
+      setBtnBusy(btn, 'Saving...');
+      cell.innerHTML = busyText('Saving...');
       cell.className = 'row-status';
       try {
         const res = await checkedFetch('/api/wop-fix', {
@@ -1258,14 +1502,14 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
         });
         const data = await res.json();
         if (data.error) {
-          cell.textContent = data.error; cell.className = 'row-status err'; btn.disabled = false;
+          cell.textContent = data.error; cell.className = 'row-status err'; clearBtnBusy(btn);
         } else {
           cell.textContent = data.dry_run ? 'Dry run OK' : 'Moved';
           cell.className = 'row-status ok';
         }
       } catch (err) {
         if (err.message !== 'Session expired') {
-          cell.textContent = 'Failed: ' + err; cell.className = 'row-status err'; btn.disabled = false;
+          cell.textContent = 'Failed: ' + err; cell.className = 'row-status err'; clearBtnBusy(btn);
         }
       }
     });
@@ -1275,37 +1519,52 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
 document.getElementById('form6SubmitAll').addEventListener('click', async () => {
   const rowsEl = [...document.querySelectorAll('#form6Table tbody tr')];
   const toSubmit = rowsEl.filter(tr => tr.querySelector('.row-check').checked);
-  if (!toSubmit.length) { alert('No rows checked.'); return; }
+  if (!toSubmit.length) {
+    alertModal('No rows checked', 'Tick the rows you want written to HRIS first.');
+    return;
+  }
 
   const missingMatch = toSubmit.filter(tr => form6Rows[tr.dataset.idx].employeeId === null);
   if (missingMatch.length) {
-    alert(`${missingMatch.length} checked row(s) don't have a matched employee yet — click "Find" and pick a match for each before submitting.`);
+    await alertModal(
+      `${missingMatch.length} row(s) have no employee yet`,
+      'Click "Find" on each of those rows and pick the matching employee before submitting.'
+    );
     return;
   }
 
   if (SUBMIT_ENABLED) {
     const wop = toSubmit.filter(tr => form6Rows[tr.dataset.idx].draft.action_taken === 'WOP').length;
-    const split = wop
-      ? `\\n${toSubmit.length - wop} under "used", ${wop} under "without pay".`
-      : '';
-    if (!confirm(`This will write ${toSubmit.length} real record(s) to HRIS.${split}\\n\\nContinue?`)) return;
+    const people = new Set(toSubmit.map(tr => form6Rows[tr.dataset.idx].employeeId)).size;
+    const ok = await confirmModal({
+      title: `Write ${toSubmit.length} record(s) to HRIS?`,
+      rows: [
+        ['Rows', `${toSubmit.length} across ${people} employee(s)`],
+        ['Under "used"', `${toSubmit.length - wop} row(s)`],
+        ['Under "without pay"', `${wop} row(s)`],
+      ],
+      note: 'These are real records, written one at a time. It cannot be undone from this tool.',
+      confirmText: `Write ${toSubmit.length} record(s)`,
+    });
+    if (!ok) return;
   }
 
   const submitBtn = document.getElementById('form6SubmitAll');
   const progress = document.getElementById('form6Progress');
   const bar = progress.firstElementChild;
   const submitStatus = document.getElementById('form6SubmitStatus');
-  submitBtn.disabled = true;
-  submitBtn.textContent = 'Submitting...';
+  setBtnBusy(submitBtn, `Submitting 1 of ${toSubmit.length}...`);
+  progress.classList.remove('indeterminate');
   let done = 0, failed = 0;
 
   for (const tr of toSubmit) {
     const idx = tr.dataset.idx;
-    submitStatus.textContent = `Submitting ${done + 1} of ${toSubmit.length}...`;
+    submitStatus.innerHTML = busyText(`Submitting ${done + 1} of ${toSubmit.length}...`);
+    setBtnBusy(submitBtn, `Submitting ${done + 1} of ${toSubmit.length}...`);
     // Keep the row being written in view, so a long batch stays followable.
     tr.scrollIntoView({ block: 'nearest' });
     const statusCell = tr.querySelector('.row-status');
-    statusCell.textContent = 'Submitting...';
+    statusCell.innerHTML = busyText('Submitting...');
     statusCell.className = 'row-status';
     const body = {
       employee_id: form6Rows[idx].employeeId,
@@ -1341,8 +1600,7 @@ document.getElementById('form6SubmitAll').addEventListener('click', async () => 
     bar.style.width = (done / toSubmit.length * 100) + '%';
   }
 
-  submitBtn.disabled = false;
-  submitBtn.textContent = 'Submit checked rows';
+  clearBtnBusy(submitBtn, 'Submit checked rows');
   // Submitted rows untick themselves, so what is left checked is exactly
   // what still needs another go.
   submitStatus.textContent = failed

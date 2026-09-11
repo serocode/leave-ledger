@@ -229,3 +229,41 @@ def test_add_still_requires_positive_days(add_client):
     resp = test_client.post("/api/add", json={**ADD_BODY, "used": "0", "without_pay": True})
     assert resp.status_code == 400
     assert recorder.calls == []
+
+
+def test_form6_page_ships_the_progress_ui(client):
+    """The upload's two slow steps (OCR, then one HRIS search per name) each
+    have to show a live indicator — a silent page reads as a hung app."""
+    test_client, _ = client
+    html = test_client.get("/").get_data(as_text=True)
+    assert "form6Busy(" in html            # the shared spinner/bar panel
+    assert ".spinner {" in html            # and it has a spinner to show
+    assert "FORM6_MATCH_CHUNK" in html     # names go up in groups, not one silent batch
+    assert "just-matched" in html          # rows settle visibly as they resolve
+
+
+def test_match_handles_a_chunk_of_names(client):
+    """The UI now sends names a few at a time; each small request must behave
+    exactly like the old single big one."""
+    test_client, stub = client
+    resp = test_client.post("/api/match", json={"names": ["Santos, Juana", "Reyes, Pedro"]})
+    matches = resp.get_json()["matches"]
+    assert len(matches["Santos, Juana"]["results"]) == 1
+    assert len(matches["Reyes, Pedro"]["results"]) == 2
+    assert stub.queries == ["Santos, Juana", "Reyes, Pedro"]
+
+
+def test_write_paths_confirm_in_a_modal_not_a_native_dialog(client):
+    """Native confirm() can be suppressed for a session ("don't ask again"),
+    which would leave nothing between a typo and a real HRIS record."""
+    test_client, _ = client
+    html = test_client.get("/").get_data(as_text=True)
+    script = html[html.index("<script>"):]
+    # Comments talk about confirm()/alert() on purpose — judge the code only.
+    code = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("//")
+    )
+    assert "confirmModal(" in code
+    assert "dialog.modal" in html                 # the styled dialog element
+    assert "confirm(" not in code.replace("confirmModal(", "")
+    assert "alert(" not in code.replace("alertModal(", "")
