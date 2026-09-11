@@ -93,3 +93,50 @@ def test_day_counts_tolerate_small_print_misreads(raw, expected):
     """Half days are the only fraction these forms use, so a decimal point is
     the half marker regardless of what the digit after it came out as."""
     assert ocr_form6._normalize_total_days(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # One day.
+        ("June 30, 2026", [("2026-06-30", "2026-06-30", 1.0)]),
+        # A parenthesized half-day marker.
+        ("June 29(pm), 2026", [("2026-06-29", "2026-06-29", 0.5)]),
+        # "&"-joined ranges stay separate runs (non-adjacent days).
+        ("July 1-3 & 6-7, 2026", [("2026-07-01", "2026-07-03", 3.0),
+                                  ("2026-07-06", "2026-07-07", 2.0)]),
+        # Two months in one cell, ";"-separated, second day a half.
+        ("June 30, 2026; July 2(pm), 2026", [("2026-06-30", "2026-06-30", 1.0),
+                                             ("2026-07-02", "2026-07-02", 0.5)]),
+        # Adjacent days merge into one run, half-day included in the count.
+        ("July 1(pm) & 2, 2026", [("2026-07-01", "2026-07-02", 1.5)]),
+        ("June 25 & 30, 2026", [("2026-06-25", "2026-06-25", 1.0),
+                                ("2026-06-30", "2026-06-30", 1.0)]),
+        ("July 3 & 6-7, 2026", [("2026-07-03", "2026-07-03", 1.0),
+                                ("2026-07-06", "2026-07-07", 2.0)]),
+        # A run that crosses a month boundary is still one contiguous run.
+        ("June 30 & July 1, 2026", [("2026-06-30", "2026-07-01", 2.0)]),
+    ],
+)
+def test_absence_dates_cover_the_masterson_cell_shapes(raw, expected):
+    runs, warning = ocr_form6._parse_date_segments_absence(raw, 2026)
+    assert warning is None
+    assert [(f.isoformat(), t.isoformat(), u) for f, t, u in runs] == expected
+
+
+def test_absence_dates_prefer_the_printed_year_over_the_page_header():
+    runs, warning = ocr_form6._parse_date_segments_absence("June 30, 2025", 2026)
+    assert warning is None
+    assert runs[0][0].year == 2025
+
+
+def test_absence_dates_report_unreadable_cells_instead_of_guessing():
+    for raw in ("", "wwe", "July 7-3, 2026", "June 31, 2026"):
+        runs, warning = ocr_form6._parse_date_segments_absence(raw, 2026)
+        assert runs == [] and warning, raw
+
+
+def test_absence_dates_without_any_year_say_so():
+    runs, warning = ocr_form6._parse_date_segments_absence("June 30", None)
+    assert runs == []
+    assert "year" in warning

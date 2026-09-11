@@ -17,8 +17,9 @@ Pipeline (tuned and verified against a real Macanhan Elementary School Form
   2. Detect grid lines (morphological open on a binary threshold) and pull
      out individual cell bounding boxes.
   3. Group cells into rows (by y-position) and sort each row left-to-right;
-     keep only rows with the expected 9-column shape (a header row and any
-     stray/blank rows naturally fall out of this).
+     the row's column count picks the template to read it with (see the
+     COLUMN_CONFIGS* tables); a header row and any stray/blank rows
+     naturally fall out of this.
   4. OCR each cell individually rather than the whole table at once — much
      more reliable for a bordered form, and lets each column use tuned
      settings (see COLUMN_CONFIGS below; psm 8 in particular does badly on
@@ -283,6 +284,11 @@ _DAYS_WHITELIST = "0123456789."
 # For a "<date-list>, YYYY (N day(s))" cell that bundles dates, half-day
 # markers, and the day count all in one (Iponan Elementary School template).
 _COMBINED_DATES_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789(),./ "
+# For a "Date/s of Absence" cell that can hold several months, day ranges,
+# "&"/";" separators and parenthesized half-day markers all at once
+# ("July 1-3 & 6-7, 2026", "June 30, 2026; July 2(pm), 2026"). Every one of
+# those separators has to survive OCR or the cell reads as the wrong days.
+_ABSENCE_DATES_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789(),;&- "
 
 # (tesseract --psm, whitelist or None) per column, in left-to-right order.
 # Found by testing directly against a real sample, not assumed defaults —
@@ -321,6 +327,21 @@ COLUMN_CONFIGS_3COL = [
     (6, None),                          # 0: "<No>. Last, First M.I."
     (6, _COMBINED_DATES_WHITELIST),     # 1: No. of Days (dates + markers + count, combined)
     (6, _WORD_OR_CODE_WHITELIST),       # 2: Remarks ("SL-WP")
+]
+
+# A fifth template (seen from Fr. William F. Masterson S.J. ES): a
+# "Summary of Absences" transmittal — No./Name/Position/Date/s of Absence/
+# Days/Remarks. It has no Leave Type column at all (see _extract_6col_row),
+# and its date cell is the most free-form of the lot: several months in one
+# cell, day ranges, "&" and ";" separators, and parenthesized "(am)"/"(pm)"
+# half-day markers ("June 30, 2026; July 2(pm), 2026").
+COLUMN_CONFIGS_6COL = [
+    (7, None),                          # 0: No.
+    (6, None),                          # 1: Teachers' Name ("Last, First M.I.")
+    (7, None),                          # 2: Position
+    (6, _ABSENCE_DATES_WHITELIST),      # 3: Date/s of Absence
+    (7, _DAYS_WHITELIST),               # 4: Days
+    (6, _WORD_OR_CODE_WHITELIST),       # 5: Remarks ("w/ pay" / "w/o pay")
 ]
 
 # A fourth template (seen from Lumbia National High School): its own Seq No.
@@ -434,6 +455,9 @@ def _normalize_position(raw: str) -> str:
     """Best-effort only — Position is not sent to HRIS, just shown for the
     user's own cross-check, so this doesn't need to be perfect."""
     cleaned = raw.strip().upper().replace(" ", "").rstrip(".,-_]['\"")
+    # Adjacent "I"s fuse into an "H" often enough to be worth folding in
+    # ("T-HI" is always "T-III", never a real position).
+    cleaned = re.sub(r"^T([-_]?)H(?=[I1L|!])", r"T\g<1>II", cleaned)
     m = re.match(r"^T[-_]?([I1L|!]+)$", cleaned)
     if m:
         n = min(len(m.group(1)), 4)
@@ -609,6 +633,89 @@ def _parse_date_segments_monthname(
         return [(f, t, u) for f, t, u in runs], None
     except ValueError:
         return [], f"Invalid date parsed from {raw!r} — enter manually."
+
+
+_ABSENCE_TOKEN_RE = re.compile(
+    r"(?P<year>20\d{2})"
+    r"|(?P<word>[A-Za-z]+)"
+    r"|(?P<d1>\d{1,2})\s*(?:\(\s*(?P<h1>am|pm)\s*\)?)?"
+    r"(?:\s*-\s*(?P<d2>\d{1,2})\s*(?:\(\s*(?P<h2>am|pm)\s*\)?)?)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_date_segments_absence(
+    raw: str, default_year: int | None
+) -> tuple[list[tuple[date, date, float]], str | None]:
+    """Parse a free-form "Date/s of Absence" cell (the Masterson ES
+    template): "June 30, 2026", "July 1-3 & 6-7, 2026", "June 29(pm), 2026",
+    "June 30, 2026; July 2(pm), 2026".
+
+    Unlike the other month-name parser this one tracks the month as it scans,
+    so a cell may span more than one, and it expands "D-D" ranges rather than
+    reading their endpoints as two separate days. The year is usually printed
+    *after* the days it belongs to, so days are held pending until a year
+    token arrives (falling back to the page header's year at the end).
+
+    Consecutive calendar days become one contiguous (date_from, date_to,
+    used) run each, with an "(am)"/"(pm)" day counting as half.
+    """
+    fail = ([], f"Could not parse dates from {raw!r} — enter manually.")
+    month: int | None = None
+    pending: list[tuple[int, int, bool]] = []  # (month, day, is_half), year not yet known
+    dated: list[tuple[date, bool]] = []
+
+    def _flush(year: int) -> bool:
+        for mo, day, is_half in pending:
+            try:
+                dated.append((date(year, mo, day), is_half))
+            except ValueError:
+                return False
+        pending.clear()
+        return True
+
+    for m in _ABSENCE_TOKEN_RE.finditer(raw):
+        if m.group("year"):
+            if not _flush(int(m.group("year"))):
+                return [], f"Invalid date parsed from {raw!r} — enter manually."
+        elif m.group("word"):
+            # Anything that isn't a month name is OCR noise (a stray letter,
+            # a descender bleeding in from the row above) — ignore it.
+            month = _MONTH_NAME_TO_NUM.get(m.group("word").lower(), month)
+        elif m.group("d1"):
+            if month is None:
+                return fail
+            d1, d2 = int(m.group("d1")), int(m.group("d2") or m.group("d1"))
+            if d2 < d1:
+                return fail
+            for day in range(d1, d2 + 1):
+                # A half-day marker only ever attaches to an endpoint.
+                is_half = bool(m.group("h1") if day == d1 else None) or (
+                    day == d2 and bool(m.group("h2"))
+                )
+                pending.append((month, day, is_half))
+
+    if pending:
+        if default_year is None:
+            return [], f"Could not determine the year for {raw!r} — enter manually."
+        if not _flush(default_year):
+            return [], f"Invalid date parsed from {raw!r} — enter manually."
+    if not dated:
+        return fail
+
+    runs: list[tuple[date, date, float]] = []
+    start = end = dated[0][0]
+    used = 0.5 if dated[0][1] else 1.0
+    for day, is_half in dated[1:]:
+        if day == end + timedelta(days=1):
+            end = day
+            used += 0.5 if is_half else 1.0
+        else:
+            runs.append((start, end, used))
+            start = end = day
+            used = 0.5 if is_half else 1.0
+    runs.append((start, end, used))
+    return runs, None
 
 
 def _finish_run(month: int, year: int, start_day: int, end_day: int, length: int, half_count: int) -> tuple[date, date, float]:
@@ -1028,6 +1135,62 @@ def _extract_7col_row(
     )
 
 
+def _extract_6col_row(
+    img: np.ndarray, row_boxes: list[tuple[int, int, int, int]], default_year: int | None, seq: int
+) -> list[Form6Row]:
+    """The Masterson ES "Summary of Absences" layout: No./Name/Position/
+    Date/s of Absence/Days/Remarks.
+
+    This template prints no leave type — the Remarks column carries only
+    "w/ pay" / "w/o pay" — so the type is taken as SL, which is what this
+    tool records and what these transmittals are in practice. The draft rows
+    still land in the review table with their leave type shown, so anything
+    that was really another type can be unticked before submitting.
+
+    That missing column also means the Remarks cell is the only thing
+    separating this from any other 6-column table of teacher names, so a row
+    whose Remarks doesn't read as with/without pay is dropped.
+    """
+    raw_values = [_ocr_cell(img, box, psm, wl) for box, (psm, wl) in zip(row_boxes, COLUMN_CONFIGS_6COL)]
+
+    name_raw = raw_values[1].strip()
+    if len(name_raw) < 3 or "," not in name_raw:
+        # Header remnants, a section label, a blank/noise row.
+        return []
+
+    action_taken = _normalize_action(raw_values[5])
+    if action_taken not in ("WP", "WOP"):
+        return []
+
+    row_no = _normalize_digits(raw_values[0])
+    if not row_no.isdigit():
+        # Small-print and often misread; it is never sent to HRIS, so fall
+        # back to counting position rather than dropping the row.
+        row_no = str(seq)
+
+    last_name, first_name, middle_initial = _split_combined_name(name_raw)
+    dates_raw = raw_values[3].strip()
+    days_raw = raw_values[4].strip()
+    segments, warning = _parse_date_segments_absence(dates_raw, default_year)
+
+    return _rows_from_segments(
+        row_no=row_no,
+        last_name=last_name,
+        first_name=first_name,
+        middle_initial=middle_initial,
+        position_raw=_normalize_position(raw_values[2]),
+        dates_raw=dates_raw,
+        days_raw=days_raw,
+        leave_type="SL",
+        action_taken=action_taken,
+        in_scope=True,
+        segments=[(f, t) for f, t, _ in segments],
+        total_override=_normalize_total_days(days_raw),
+        unparsed_warning=warning,
+        default_used=[u for _, _, u in segments] or None,
+    )
+
+
 def _extract_3col_row(img: np.ndarray, row_boxes: list[tuple[int, int, int, int]]) -> list[Form6Row]:
     """The Iponan Elementary School layout: just 3 columns (Name / No. of
     Days / Remarks) — the row number lives inside the Name cell text
@@ -1106,18 +1269,30 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
     for row_boxes in grouped:
         row_boxes = sorted(row_boxes, key=lambda b: b[0])
         if len(row_boxes) == len(COLUMN_CONFIGS):
-            results.extend(_extract_9col_row(warped, row_boxes))
+            row_results = _extract_9col_row(warped, row_boxes)
         elif len(row_boxes) == len(COLUMN_CONFIGS_7COL):
             seq += 1
-            results.extend(_extract_7col_row(warped, row_boxes, default_year, seq))
+            row_results = _extract_7col_row(warped, row_boxes, default_year, seq)
+        elif len(row_boxes) == len(COLUMN_CONFIGS_6COL):
+            seq += 1
+            row_results = _extract_6col_row(warped, row_boxes, default_year, seq)
         elif len(row_boxes) == len(COLUMN_CONFIGS_5COL):
             seq += 1
-            results.extend(_extract_5col_row(warped, row_boxes, default_year, seq))
+            row_results = _extract_5col_row(warped, row_boxes, default_year, seq)
         elif len(row_boxes) == len(COLUMN_CONFIGS_3COL):
-            results.extend(_extract_3col_row(warped, row_boxes))
+            row_results = _extract_3col_row(warped, row_boxes)
+        else:
+            row_results = []
+
+        if row_results:
+            results.extend(row_results)
         elif len(row_boxes) > 1:
-            # A table row in a column layout no template covers. Counted so
-            # the caller can say so instead of silently reporting "0 rows".
+            # Either a column layout no template covers, or one that matched
+            # a template by column count but that the template then rejected
+            # (a header row, or a different DepEd form that happens to have
+            # the same number of columns). Counted either way so the caller
+            # can say so instead of silently reporting "0 rows" — it is only
+            # ever read when the whole document yielded nothing.
             unmatched[len(row_boxes)] += 1
 
     return results, seq, unmatched
@@ -1136,8 +1311,8 @@ def extract_form6(image_path: str) -> list[Form6Row]:
     only carry a single start/end date, so this is the only way to keep
     every real date range submittable on its own.
 
-    Supports two table layouts, dispatched purely by how many columns a
-    detected row has (9 vs 5) — see _extract_9col_row / _extract_5col_row.
+    Supports five table layouts, dispatched purely by how many columns a
+    detected row has (3, 5, 6, 7 or 9) — see _extract_3col_row and friends.
     """
     pages = _load_pages(image_path)
 
@@ -1162,7 +1337,7 @@ def extract_form6(image_path: str) -> list[Form6Row]:
             layouts = ", ".join(f"{n}-column ({c} rows)" for n, c in sorted(unmatched.items()))
             raise ValueError(
                 f"Found a table, but its layout isn't one this tool knows how to read: {layouts}. "
-                "The supported Form 6 templates have 3, 5, 7, or 9 columns."
+                "The supported Form 6 templates have 3, 5, 6, 7, or 9 columns."
             )
         if errors:
             raise ValueError("; ".join(errors))

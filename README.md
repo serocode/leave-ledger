@@ -108,10 +108,17 @@ matching employee (the name read off the scan is a starting point, not a
 guarantee) before hitting "Submit checked rows". A row flagged with a parse
 warning (e.g. an unreadable date) needs its dates filled in by hand.
 
-Schools lay this form out differently, so the reader recognises four column
-layouts (3, 5, 7 and 9 columns) and picks whichever one a page matches. If a
-form's table matches none of them, the upload now says so outright instead of
-quietly coming back with zero rows.
+Schools lay this form out differently, so the reader recognises five column
+layouts (3, 5, 6, 7 and 9 columns) and picks whichever one a page matches. If
+a form's table matches none of them, the upload now says so outright instead
+of quietly coming back with zero rows.
+
+One of those layouts — the 6-column "Summary of Absences" transmittal
+(No./Name/Position/Date/s of Absence/Days/Remarks) — prints no leave type at
+all, only "w/ pay" or "w/o pay", so its rows are drafted as **sick leave**.
+That is what these transmittals are in practice and what this tool records,
+but it is an assumption: check the leave type shown on each row before
+submitting, and untick anything that was really another type.
 
 Verified against a real Macanhan Elementary School Form 6 transmittal
 (2026-09-10, 19 employee rows): names, dates (including multi-day ranges),
