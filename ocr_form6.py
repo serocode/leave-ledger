@@ -42,6 +42,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -345,13 +347,59 @@ def _ocr_cell(img: np.ndarray, box: tuple[int, int, int, int], psm: int, whiteli
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     _, binarized = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     binarized = cv2.copyMakeBorder(binarized, 14, 14, 14, 14, cv2.BORDER_CONSTANT, value=255)
-    config = f"--psm {psm}"
-    if whitelist:
-        config += f' -c tessedit_char_whitelist="{whitelist}"'
     # Collapse a wrapped 2-line cell ("PHOEBE\nCHARMENNE") to one line — every
     # caller wants flat text, and the numeric/date parsers strip whitespace
     # anyway, so this is safe everywhere.
-    return " ".join(pytesseract.image_to_string(binarized, config=config).split())
+    return " ".join(_run_tesseract(binarized, psm, whitelist).split())
+
+
+def _run_tesseract(img: np.ndarray, psm: int, whitelist: str | None) -> str:
+    """Run tesseract on one prepared cell image and return its text.
+
+    This calls the binary directly instead of going through
+    pytesseract.image_to_string because that splits its `config` string with
+    `shlex.split(config, posix=not_windows)`. Several of our whitelists
+    contain a space (they have to: "SICK LEAVE", "June 25-26,2026"), and on
+    Windows the non-POSIX mode cannot parse a quoted value containing one —
+    it raises "No closing quotation", so every such cell failed and the whole
+    page came back empty. Passing argv as a list has no quoting step at all,
+    so the whitelist arrives intact on every platform.
+    """
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise ValueError("Could not encode a table cell for OCR.")
+
+    # Via a temp file rather than stdin: that is the path pytesseract already
+    # used successfully here, so quoting is the only thing being changed. A
+    # temp path containing spaces ("C:\\Users\\Juan Dela Cruz\\...") is fine
+    # precisely because argv is a list.
+    fd, path = tempfile.mkstemp(suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(buf.tobytes())
+
+        cmd = [pytesseract.pytesseract.tesseract_cmd, path, "stdout", "--psm", str(psm)]
+        if whitelist:
+            cmd += ["-c", f"tessedit_char_whitelist={whitelist}"]
+
+        # Keep a console window from flashing on Windows, once per cell.
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            proc = subprocess.run(cmd, capture_output=True, creationflags=creationflags)
+        except FileNotFoundError:
+            raise ValueError(
+                "Tesseract OCR is not installed, or not where this tool can find it. "
+                "Everything except reading Form 6 scans works without it."
+            ) from None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    if proc.returncode != 0:
+        raise ValueError(f"Tesseract failed: {proc.stderr.decode('utf-8', 'replace')[:200]}")
+    return proc.stdout.decode("utf-8", "replace")
 
 
 # ---------------------------------------------------------------------------
