@@ -265,6 +265,12 @@ class HrisClient:
             deduct from the employee's balance. Unlike `used`, a non-zero
             `wo_pay` goes as a NUMBER, not a string (confirmed 2026-09-11
             against a real record moved from `used` to `wo_pay`).
+          - Credits ADDED to the ledger (a vacation service credit grant) go in
+            `earned`, as a NUMBER rounded to 3 decimals. Unlike `used` and
+            `wo_pay`, a non-zero `earned` has NOT yet been confirmed against a
+            real submission — the field accepted both a string (`used`) and a
+            number (`wo_pay`) in the confirmed cases, so a number is expected
+            to work, but check the first real grant recorded in HRIS itself.
           - `hrisBy` is REQUIRED — it's the *submitting* HRIS user's own id
             (i.e. `client.user_id` after login), not the employee the leave
             is being recorded for. This was missing entirely from the

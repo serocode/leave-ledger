@@ -231,15 +231,40 @@ def test_add_still_requires_positive_days(add_client):
     assert recorder.calls == []
 
 
-def test_form6_page_ships_the_progress_ui(client):
-    """The upload's two slow steps (OCR, then one HRIS search per name) each
-    have to show a live indicator — a silent page reads as a hung app."""
+def test_both_upload_tabs_ship_the_progress_ui(client):
+    """Each upload's two slow steps (OCR, then one HRIS search per name) show
+    a live indicator — a silent page reads as a hung app."""
     test_client, _ = client
     html = test_client.get("/").get_data(as_text=True)
-    assert "form6Busy(" in html            # the shared spinner/bar panel
+    assert "busyPanel(" in html            # the shared spinner/bar panel
     assert ".spinner {" in html            # and it has a spinner to show
-    assert "FORM6_MATCH_CHUNK" in html     # names go up in groups, not one silent batch
+    assert "MATCH_CHUNK" in html           # names go up in groups, not one silent batch
     assert "just-matched" in html          # rows settle visibly as they resolve
+
+
+def test_leave_and_service_credits_are_separate_tabs(client):
+    """Earning credits is its own workflow: its own tab, upload and review."""
+    import re
+    test_client, _ = client
+    html = test_client.get("/").get_data(as_text=True)
+    assert 'data-tab="vsc"' in html and 'id="tab-vsc"' in html
+    # Every element a workspace looks up exists for both prefixes.
+    for suffix in ("File", "Upload", "Status", "Notes", "Kpis", "KpiPeople", "KpiPeopleFoot",
+                   "KpiAuto", "KpiAutoFoot", "KpiAttention", "Kpi4", "ReviewCard", "Summary",
+                   "Table", "CheckAll", "Empty", "BarTitle", "Progress", "SubmitStatus", "SubmitAll"):
+        for prefix in ("form6", "vsc"):
+            assert html.count(f'id="{prefix}{suffix}"') == 1, f"{prefix}{suffix}"
+    # No element id is defined twice anywhere on the page.
+    ids = re.findall(r'\sid="([^"{}]+)"', html)
+    dupes = {i for i in ids if ids.count(i) > 1}
+    assert not dupes, dupes
+
+
+def test_the_individual_tab_only_deducts_now(client):
+    test_client, _ = client
+    html = test_client.get("/").get_data(as_text=True)
+    employee_tab = html[html.index('id="tab-employee"'):html.index('id="tab-wop"')]
+    assert 'name="earned"' not in employee_tab and 'value="earn"' not in employee_tab
 
 
 def test_match_handles_a_chunk_of_names(client):
@@ -267,3 +292,124 @@ def test_write_paths_confirm_in_a_modal_not_a_native_dialog(client):
     assert "dialog.modal" in html                 # the styled dialog element
     assert "confirm(" not in code.replace("confirmModal(", "")
     assert "alert(" not in code.replace("alertModal(", "")
+
+
+# --- Recording service credits earned ---------------------------------------
+
+def _record(**overrides):
+    body = {
+        "employee_id": 7, "description": "Vacation service credits May 6 - June 2, 2026 (138 hrs)",
+        "date_from": "2026-05-06", "date_to": "2026-06-02",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_credits_earned_go_to_earned_and_deduct_nothing(add_client):
+    test_client, recorder = add_client
+    resp = test_client.post("/api/add", json=_record(earned="25.944"))
+    assert resp.status_code == 200, resp.get_json()
+    written = recorder.calls[-1]
+    assert written["earned"] == 25.944
+    assert float(written["used"]) == 0 and written["wo_pay"] == 0
+
+
+def test_earned_is_rounded_to_the_ledgers_three_decimals(add_client):
+    test_client, recorder = add_client
+    test_client.post("/api/add", json=_record(earned=25.943999999))
+    assert recorder.calls[-1]["earned"] == 25.944
+
+
+def test_a_record_cannot_both_add_and_deduct(add_client):
+    test_client, recorder = add_client
+    resp = test_client.post("/api/add", json=_record(earned="1.5", used="1"))
+    assert resp.status_code == 400 and not recorder.calls
+
+
+def test_without_pay_cannot_ride_along_on_a_grant(add_client):
+    """A stray WOP tick on a grant must not route the credits to wo_pay."""
+    test_client, recorder = add_client
+    test_client.post("/api/add", json=_record(earned="1.5", without_pay=True))
+    written = recorder.calls[-1]
+    assert written["earned"] == 1.5 and written["wo_pay"] == 0
+
+
+def test_leave_deductions_are_unchanged(add_client):
+    test_client, recorder = add_client
+    test_client.post("/api/add", json=_record(used="1", description="Sick leave July 3, 2026"))
+    written = recorder.calls[-1]
+    assert float(written["used"]) == 1 and written["earned"] == 0 and written["wo_pay"] == 0
+    test_client.post("/api/add", json=_record(used="2", without_pay=True, description="Sick leave"))
+    written = recorder.calls[-1]
+    assert written["wo_pay"] == 2 and float(written["used"]) == 0 and written["earned"] == 0
+
+
+def test_nothing_to_record_is_refused(add_client):
+    test_client, recorder = add_client
+    assert test_client.post("/api/add", json=_record()).status_code == 400
+    assert not recorder.calls
+
+
+def test_ocr_passes_unreadable_page_notes_to_the_ui(client, monkeypatch):
+    import io
+    test_client, _ = client
+    monkeypatch.setattr(
+        app_module, "extract_form6_with_notes",
+        lambda path: ([], ["Page 4: found a table with 11 rows but couldn't read any of them."]),
+    )
+    resp = test_client.post(
+        "/api/ocr", data={"file": (io.BytesIO(b"fake"), "scan.pdf")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["notes"] == ["Page 4: found a table with 11 rows but couldn't read any of them."]
+
+
+def _ocr_rows(*kinds):
+    import ocr_form6
+    rows = []
+    for i, kind in enumerate(kinds):
+        r = ocr_form6.Form6Row(str(i + 1), "Cruz", "Ana", "", "", "", "", "SL" if kind == "leave" else "VSC", "WP")
+        r.kind = kind
+        rows.append(r)
+    return rows
+
+
+def _post_scan(test_client, expect):
+    import io
+    return test_client.post(
+        f"/api/ocr?expect={expect}", data={"file": (io.BytesIO(b"fake"), "scan.jpg")},
+        content_type="multipart/form-data",
+    )
+
+
+def test_a_grant_uploaded_on_the_form6_tab_is_sent_to_its_own_tab(client, monkeypatch):
+    test_client, _ = client
+    monkeypatch.setattr(app_module, "extract_form6_with_notes", lambda path: (_ocr_rows("vsc", "vsc"), []))
+    resp = _post_scan(test_client, "leave")
+    assert resp.status_code == 422 and "Service Credits Earned tab" in resp.get_json()["error"]
+
+
+def test_a_form6_uploaded_on_the_credits_tab_is_sent_back(client, monkeypatch):
+    test_client, _ = client
+    monkeypatch.setattr(app_module, "extract_form6_with_notes", lambda path: (_ocr_rows("leave"), []))
+    resp = _post_scan(test_client, "vsc")
+    assert resp.status_code == 422 and "Form 6 tab" in resp.get_json()["error"]
+
+
+def test_a_mixed_upload_keeps_only_this_tabs_rows_and_says_so(client, monkeypatch):
+    test_client, _ = client
+    monkeypatch.setattr(app_module, "extract_form6_with_notes", lambda path: (_ocr_rows("vsc", "leave", "vsc"), []))
+    data = _post_scan(test_client, "vsc").get_json()
+    assert [r["kind"] for r in data["rows"]] == ["vsc", "vsc"]
+    assert any("other kind" in n for n in data["notes"])
+
+
+def test_the_page_defines_the_submit_switch_every_write_path_reads(client):
+    """Removing the old earned mode once cut this declaration out with it —
+    the page still parsed, and every submit button on every tab threw."""
+    test_client, _ = client
+    html = test_client.get("/").get_data(as_text=True)
+    script = html[html.index("<script>"):]
+    assert script.count("const SUBMIT_ENABLED =") == 1
+    assert script.index("const SUBMIT_ENABLED =") < script.index("createReviewWorkspace('form6'")

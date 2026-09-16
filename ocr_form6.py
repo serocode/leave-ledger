@@ -97,6 +97,11 @@ class Form6Row:
     used: str = ""
     parse_warning: str | None = None
     in_scope: bool = False  # True when leave_type == "SL" and action_taken in {"WP", "WOP"}
+    # "leave" deducts days (used / wo_pay); "vsc" is a vacation service credit
+    # grant, which adds them (earned) — different column, opposite direction.
+    kind: str = "leave"
+    hours: float | None = None
+    earned: str = ""
 
     @property
     def full_name_search(self) -> str:
@@ -241,6 +246,17 @@ def _drop_nested_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int
         ix, iy, iw, ih = inner
         ox, oy, ow, oh = outer
         return ix >= ox - 2 and iy >= oy - 2 and ix + iw <= ox + ow + 2 and iy + ih <= oy + oh + 2
+
+    # A box holding two or more others isn't a cell at all — it's a region of
+    # the page the grid-line mask failed to split (seen on a scan where one
+    # contour covered the left four columns of a whole table). Left in, it
+    # would count as the "larger box" below, and every genuine cell inside it
+    # would be dropped as a stray mark — ten rows gone without a trace.
+    regions = {
+        i for i, b in enumerate(boxes)
+        if sum(1 for j, other in enumerate(boxes) if i != j and other != b and _contained(other, b)) >= 2
+    }
+    boxes = [b for i, b in enumerate(boxes) if i not in regions]
 
     kept = []
     for i, b in enumerate(boxes):
@@ -388,6 +404,11 @@ COLUMN_CONFIGS_7COL = [
 _HEADER_FIELDS: list[tuple[str, tuple[str, ...]]] = [
     ("last", ("LASTNAME", "SURNAME")),
     ("first", ("FIRSTNAME", "GIVENNAME")),
+    # A service-credit grant's columns — ahead of everything below, because
+    # "No. of hours Served" would otherwise land on the row-number column and
+    # "No. of Vacation Service Credits Granted" on Action (VAC-ACTION).
+    ("hours", ("HOUR", "HRS")),
+    ("credits", ("CREDIT", "GRANTED", "SERVICE", "EARNED")),
     ("days", ("DAY",)),
     ("dates", ("DATE", "INCLUSIVE")),
     ("type", ("TYPEOFLEAVE", "LEAVETYPE", "TYPE", "CAUSE", "KIND")),
@@ -411,21 +432,60 @@ def _header_field(raw: str) -> str | None:
     return None
 
 
-def _map_header_row(img: np.ndarray, header_boxes: list[tuple[int, int, int, int]]) -> dict[int, str] | None:
-    """Read a candidate header row. Returns {x-centre: field} or None when the
-    row doesn't look like a header at all."""
+def _header_fields_all(raw: str) -> set[str]:
+    """Every field a header's text mentions, not just the first by priority —
+    so a header cell that is really two cells can be told apart."""
+    cleaned = re.sub(r"[^A-Za-z]", "", raw).upper()
+    found = {field for field, patterns in _HEADER_FIELDS if any(p in cleaned for p in patterns)}
+    # "No." and the "action" inside "vacation" ride along on almost anything.
+    return found - {"no", "action"}
+
+
+def _split_header_box(box: tuple[int, int, int, int], grid: list[tuple[int, int]] | None) -> list[tuple[int, int, int, int]]:
+    """The grid columns one header box spans, as boxes of their own."""
+    if not grid:
+        return [box]
+    x, y, w, h = box
+    inside = [(left, right) for left, right in grid if min(x + w, right) - max(x, left) >= 0.5 * (right - left)]
+    if len(inside) < 2:
+        return [box]
+    return [(left, y, right - left, h) for left, right in inside]
+
+
+def _map_header_row(
+    img: np.ndarray, header_boxes: list[tuple[int, int, int, int]], grid: list[tuple[int, int]] | None = None,
+) -> tuple[dict[int, str], list[tuple[int, int, int, int]]] | None:
+    """Read a candidate header row. Returns ({box x: field}, the header boxes
+    to match data cells against), or None when the row isn't a header.
+
+    A header cell whose vertical border didn't detect arrives merged with its
+    neighbour — Kauswagan's "No. of Hours Served" and "No. of Vacation Service
+    Credits Granted" came through as one cell, mapped to hours, and the credits
+    column under it was never read. A cell that names more than one field and
+    spans more than one grid column is read column by column instead. One that
+    names a single field keeps its span: "Employee Name" over Last / First /
+    M.I. is exactly how those three are recognised."""
     fields: dict[int, str] = {}
+    boxes: list[tuple[int, int, int, int]] = []
     for box in header_boxes:
-        field = _header_field(_ocr_cell(img, box, 6, None))
-        if field:
-            fields[box[0]] = field
+        text = _ocr_cell(img, box, 6, None)
+        parts = _split_header_box(box, grid) if len(_header_fields_all(text)) >= 2 else [box]
+        if len(parts) == 1:
+            parts_text = [text]
+        else:
+            parts_text = [_ocr_cell(img, part, 6, None) for part in parts]
+        for part, part_text in zip(parts, parts_text):
+            boxes.append(part)
+            field = _header_field(part_text)
+            if field:
+                fields[part[0]] = field
     # A real header names at least a person and a date; anything less is a
     # data row that happened to contain a word, and mapping against it would
     # be worse than falling back to the fixed templates.
     named = set(fields.values())
     if not named & {"name", "last"} or not named & {"dates", "days"}:
         return None
-    return fields
+    return fields, boxes
 
 
 def _fields_for_row(
@@ -458,6 +518,20 @@ def _ocr_cell(img: np.ndarray, box: tuple[int, int, int, int], psm: int, whiteli
     # caller wants flat text, and the numeric/date parsers strip whitespace
     # anyway, so this is safe everywhere.
     return " ".join(_run_tesseract(binarized, psm, whitelist).split())
+
+
+def _ocr_cell_plain(img: np.ndarray, box: tuple[int, int, int, int], psm: int, whitelist: str | None, pad: int = 4) -> str:
+    """_ocr_cell without its binarization: a 2x greyscale upscale read as-is.
+    Deliberately different preprocessing, used as an independent second
+    opinion on cells where one read can be plausibly wrong (see
+    _consensus_numeric_dates) — two reads that share every step also share
+    their mistakes."""
+    x, y, w, h = box
+    crop = img[y + pad : y + h - pad, x + pad : x + w - pad]
+    if crop.size == 0:
+        return ""
+    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    return " ".join(_run_tesseract(crop, psm, whitelist).split())
 
 
 def _run_tesseract(img: np.ndarray, psm: int, whitelist: str | None) -> str:
@@ -541,6 +615,11 @@ def _normalize_position(raw: str) -> str:
     """Best-effort only — Position is not sent to HRIS, just shown for the
     user's own cross-check, so this doesn't need to be perfect."""
     cleaned = raw.strip().upper().replace(" ", "").rstrip(".,-_]['\"")
+    # "Teacher I" .. "Teacher V", as grant forms spell the position out.
+    spelled = re.fullmatch(r"TEACHER([IVX1L|!]+)", cleaned)
+    if spelled:
+        roman = re.sub(r"[1L|!]", "I", spelled.group(1))
+        return f"Teacher {roman}"
     # Adjacent "I"s fuse into an "H" often enough to be worth folding in
     # ("T-HI" is always "T-III", never a real position).
     cleaned = re.sub(r"^T([-_]?)H(?=[I1L|!])", r"T\g<1>II", cleaned)
@@ -565,10 +644,15 @@ def _normalize_leave_type(raw: str) -> str:
         return "ML"
     if "VACATION" in cleaned:
         return "VL"
+    if "SOLO" in cleaned:
+        return "SPL"
     return cleaned
 
 
-_LEAVE_TYPE_LABELS = {"SL": "Sick leave", "PL": "Paternity leave", "ML": "Maternity leave", "VL": "Vacation leave"}
+_LEAVE_TYPE_LABELS = {
+    "SL": "Sick leave", "PL": "Paternity leave", "ML": "Maternity leave",
+    "VL": "Vacation leave", "SPL": "Solo parent leave",
+}
 
 
 def _normalize_action(raw: str) -> str:
@@ -634,6 +718,10 @@ def _parse_date_segments_numeric(raw: str) -> tuple[list[tuple[date, date]], str
         if not year_m or len(group) - year_m.end() > _MAX_TRAILING_NOISE:
             return fail
         year = int(year_m.group(1))
+        if not 2000 <= year <= 2099:
+            # "2026" read as "9096" still parses as a valid date — in the year
+            # 9096. A year that far out is a misread, never a real leave.
+            return fail
         chunks = [c for c in group[: year_m.start()].split(",") if c]
         if not chunks or "/" not in chunks[0]:
             return fail
@@ -769,10 +857,17 @@ _HALF_SYMBOL_RE = re.compile(r"[½]|\b1\s*/\s*2\b")
 
 def _normalize_total_days(raw: str) -> float | None:
     """Parse a "No. of Days" cell into a float: "1 day" -> 1.0, "5 ½ days"
-    -> 5.5, "½ day" -> 0.5, "Half" -> 0.5, "6" -> 6.0."""
-    s = raw.strip()
+    -> 5.5, "½ day" -> 0.5, "Half" -> 0.5, "6" -> 6.0, "0.5 DAY" -> 0.5."""
+    # The unit word has to go first: every rule below anchors on the number
+    # ending the cell, so "0.5 DAY" used to miss the decimal rule entirely and
+    # come back as its first integer — zero days for a half-day absence.
+    s = re.sub(r"\s*days?\.?\s*$", "", raw.strip(), flags=re.IGNORECASE).strip()
     if not s:
         return None
+    # A count printed with a leading zero is a half day whose decimal point
+    # didn't survive OCR ("0.5" -> "05"); no form writes five days as "05".
+    if re.fullmatch(r"0\s*[59]", s):
+        return 0.5
 
     # Decimal form ("0.5", "3.5", "1.5"). A half-day is the only fraction
     # these forms ever use, so the decimal point itself is the half marker —
@@ -942,6 +1037,16 @@ def _split_combined_name(raw: str) -> tuple[str, str, str]:
     return _clean_name_part(last).title(), _clean_name_part(" ".join(tokens)).title(), middle_initial
 
 
+def _format_period(date_from: str, date_to: str | None) -> str:
+    df = date.fromisoformat(date_from)
+    if not date_to or date_to == date_from:
+        return f"{MONTH_NAMES[df.month]} {df.day}, {df.year}"
+    dt = date.fromisoformat(date_to)
+    if df.month == dt.month and df.year == dt.year:
+        return f"{MONTH_NAMES[df.month]} {df.day}-{dt.day}, {df.year}"
+    return f"{MONTH_NAMES[df.month]} {df.day} - {MONTH_NAMES[dt.month]} {dt.day}, {dt.year}"
+
+
 def _build_description(leave_type: str, date_from: str | None, date_to: str | None) -> str:
     label = _LEAVE_TYPE_LABELS.get(leave_type, "Leave")
     if not date_from:
@@ -1025,12 +1130,16 @@ def _rows_from_segments(
         default_used = [(dt - df).days + 1 for df, dt in segments]
 
     seg_used: list[float]
-    warning = None
+    # A parser can fill the dates in *and* ask for them to be checked (a
+    # disagreement between OCR reads settled by majority). That warning has to
+    # reach the row: dropping it here once dates existed is what left a
+    # corrected-but-uncertain date unflagged in the review table.
+    warnings = [unparsed_warning] if unparsed_warning else []
     if trust_default or len(segments) > 1:
         seg_used = default_used
         computed_total = sum(seg_used)
         if total_override is not None and abs(computed_total - total_override) > 0.01:
-            warning = (
+            warnings.append(
                 f"Computed total ({_format_used(computed_total)} days) doesn't match the "
                 f"form's printed total ({_format_used(total_override)} days) — double-check dates."
             )
@@ -1041,7 +1150,7 @@ def _rows_from_segments(
     for (df, dt), used in zip(segments, seg_used):
         row = Form6Row(
             date_from=df.isoformat(), date_to=dt.isoformat(),
-            used=_format_used(used), parse_warning=warning,
+            used=_format_used(used), parse_warning=" ".join(warnings) or None,
             **common,
         )
         row.description = _build_description(leave_type, df.isoformat(), dt.isoformat())
@@ -1049,25 +1158,388 @@ def _rows_from_segments(
     return rows
 
 
-def _ocr_date_cell(img: np.ndarray, box: tuple[int, int, int, int]) -> str:
+def _ocr_date_cell(img: np.ndarray, box: tuple[int, int, int, int]) -> tuple[str, int]:
     """A mapped date column can hold either style — "06/30/2026" or
     "June 30, 2026" — so read it with the month-name whitelist first, then
     re-read a numeric cell under the tight digits-and-slashes one it was
     tuned for. A numeric cell read this way comes back without its slashes
-    ("06302026"), which is still enough to tell the two styles apart."""
+    ("06302026"), which is still enough to tell the two styles apart.
+
+    Returns (text, half-day markers). The numeric re-read can't represent
+    letters, so a "7/7PM/2026" would lose its PM there; the count is taken
+    from the first pass, which keeps them. Month-name cells report 0 — their
+    parser reads the markers itself."""
     raw = _ocr_cell(img, box, 6, _ABSENCE_DATES_WHITELIST)
     if _MONTH_IN_TEXT_RE.search(raw):
-        return raw
+        return raw, 0
+    halves = len(re.findall(r"\d\s*\(?\s*(?:AM|PM)\b", raw, re.IGNORECASE))
     # No month name: a numeric cell, whose slashes the first whitelist can't
     # even represent ("06/17/2026" comes back "06172026"). Read it again
     # under the digits-and-slashes whitelist that style was tuned for.
-    return _ocr_cell(img, box, 6, _DATE_WHITELIST)
+    return _ocr_cell(img, box, 6, _DATE_WHITELIST), halves
 
 
 _MONTH_IN_TEXT_RE = re.compile(
     r"\b(" + "|".join(MONTH_NAMES[1:]) + r"|" + "|".join(m[:3] for m in MONTH_NAMES[1:]) + r")",
     re.IGNORECASE,
 )
+
+
+def _describe_segments(segments: list[tuple[date, date]], with_year: bool = False) -> str:
+    parts = []
+    for f, t in segments:
+        day = f"{f.day}" if f == t else f"{f.day}-{t.day}"
+        parts.append(f"{MONTH_NAMES[f.month]} {day}" + (f", {f.year}" if with_year else ""))
+    return "; ".join(parts) if with_year else ", ".join(parts)
+
+
+def _consensus_numeric_dates(reads: list[str]) -> tuple[str, list[tuple[date, date]], str | None]:
+    """Settle a numeric date cell from several independent OCR reads, the
+    first being the primary one. Returns (text, segments, warning).
+
+    One read of "7/3/2026" can come back "7/13/2026": the slash gains a
+    phantom 1, and the result is a perfectly plausible date that parses
+    cleanly and would be submitted without a second look. A single read can't
+    tell that from a real 13th — but reads made with different settings don't
+    share the mistake, so disagreement between them is the signal.
+
+      - Every read that parses agrees: take it.
+      - The primary read failed but the others agree: take theirs. With only
+        one read to go on, flag it for a check against the paper.
+      - Reads disagree: never pick silently. A strict majority is filled in
+        and flagged with the alternatives; a tie is left blank to be entered.
+    """
+    primary = reads[0]
+    parsed: list[tuple[str, tuple[tuple[date, date], ...]]] = []
+    for text in reads:
+        segments, _ = _parse_date_segments_numeric(text)
+        if segments:
+            parsed.append((text, tuple(segments)))
+    if not parsed:
+        return primary, [], f"Could not parse dates from {primary!r} — enter manually."
+
+    votes = Counter(segs for _, segs in parsed)
+    if len(votes) == 1:
+        segs, count = next(iter(votes.items()))
+        text = next(t for t, sg in parsed if sg == segs)
+        if parsed[0][0] == primary or count >= 2:
+            return text, list(segs), None
+        return text, list(segs), (
+            f"Date read as {_describe_segments(list(segs))} on a second pass only — "
+            "check it against the paper."
+        )
+
+    # Readings that differ only in the year describe identically without it
+    # ("June 26 or June 26"), which hides the very thing in dispute.
+    plain = [_describe_segments(list(sg)) for sg, _ in votes.most_common()]
+    with_year = len(set(plain)) < len(plain)
+    options = " or ".join(_describe_segments(list(sg), with_year) for sg, _ in votes.most_common())
+    (top, top_votes), (_, runner_up) = votes.most_common(2)
+    if top_votes > runner_up:
+        text = next(t for t, sg in parsed if sg == top)
+        return text, list(top), (
+            f"OCR disagreed on this date ({options}) — the more common reading is "
+            "filled in; check it against the paper."
+        )
+    return primary, [], f"OCR disagreed on this date ({options}) — enter it from the paper."
+
+
+def _read_numeric_dates(img: np.ndarray, box: tuple[int, int, int, int], primary: str):
+    return _consensus_numeric_dates([
+        primary,
+        _ocr_cell(img, box, 13, _DATE_WHITELIST),
+        _ocr_cell_plain(img, box, 7, _DATE_WHITELIST),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Vacation service credits
+#
+# A grant form ("the following teachers are hereby granted vacation service
+# credits for services rendered during ...") runs the other way from a Form 6:
+# it adds credit to the ledger's `earned` column instead of deducting leave.
+# Its rows carry the hours served and the credits granted for them.
+# ---------------------------------------------------------------------------
+
+# Work rendered during summer or Christmas vacation, weekends or holidays is
+# credited at time-and-a-half: VSC days = hours x 1.50 / 8.
+VSC_CONVERSION_FACTOR = 1.50
+HOURS_PER_DAY = 8
+
+_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
+
+
+def _split_name_first_last(raw: str) -> tuple[str, str, str]:
+    """Split a "First M. Last" name — the order a grant form prints it in.
+
+    The middle initial is the boundary when there is one, which is what keeps
+    a compound surname whole ("Ana Marie A. Tres Reyes" -> Tres Reyes). With
+    no initial the last word is taken as the surname ("Kenneth Joh Conde").
+    A trailing suffix (Jr, III) is dropped: it isn't part of how HRIS is
+    searched, and leaving it in would make it the surname."""
+    tokens = raw.replace(",", " ").split()
+    while len(tokens) > 2 and re.sub(r"[^A-Za-z]", "", tokens[-1]).upper() in _NAME_SUFFIXES:
+        tokens.pop()
+    initials = [i for i, t in enumerate(tokens) if re.fullmatch(r"[A-Za-z]\.", t)]
+    if initials and 0 < initials[-1] < len(tokens) - 1:
+        i = initials[-1]
+        first, middle, last = tokens[:i], tokens[i], tokens[i + 1:]
+        mi = _normalize_mi(middle)
+    elif len(tokens) >= 2:
+        first, last, mi = tokens[:-1], tokens[-1:], ""
+    else:
+        return "", "", ""
+    return (
+        _clean_name_part(" ".join(last)).title(),
+        _clean_name_part(" ".join(first)).title(),
+        mi,
+    )
+
+
+def _split_any_name(raw: str) -> tuple[str, str, str]:
+    """(last, first, M.I.) from a name in either order: "Last, First M.I."
+    when there's a comma, "First M.I. Last" when there isn't."""
+    return _split_combined_name(raw) if "," in raw else _split_name_first_last(raw)
+
+
+def _normalize_hours(raw: str) -> float | None:
+    """Hours served: "138" -> 138.0, "18 HRS" -> 18.0, and the
+    hours-and-minutes form some grants use, "4HRS.& 53MINS." -> 4.883."""
+    s = raw.upper()
+    # The number in front of each unit can come back with letter look-alikes
+    # ("S3MINS" for 53, "SHRS" for 5). Only that number is folded back to
+    # digits — never the unit, whose own S would otherwise become a 5.
+    # "/" too: a 7 comes back as one ("27 HOURS" -> "2/ HOURS").
+    lookalike = "[0-9SOQ/" + re.escape("".join(_ONE_LOOKALIKES).upper()) + "]"
+    fold = str.maketrans({"S": "5", "O": "0", "Q": "0", "/": "7", **{c.upper(): "1" for c in _ONE_LOOKALIKES}})
+    hrs = re.search(rf"({lookalike}+)\s*H(?:RS?|OURS?)\b", s)
+    mins = re.search(rf"({lookalike}+)\s*MIN(?:UTE)?S?\b", s)
+    has_hour_unit = re.search(r"H(?:RS?|OURS?)\b", s)
+    has_minute_unit = re.search(r"MIN(?:UTE)?S?\b", s)
+    if has_hour_unit or has_minute_unit:
+        # A unit whose number didn't read makes the whole cell unreadable —
+        # not zero of that unit. "2/ HOURS & 40 MINUTES" used to come back as
+        # 40 minutes, a quietly wrong figure instead of an honest blank.
+        if (has_hour_unit and not hrs) or (has_minute_unit and not mins):
+            return None
+        def number(m):
+            digits = m.group(1).translate(fold) if m else "0"
+            return int(digits) if digits.isdigit() else None
+        h, mi = number(hrs), number(mins)
+        if h is None or mi is None:
+            return None
+        return round(h + mi / 60, 3)
+    m = re.search(r"\d+(?:\.\d+)?", _normalize_digits(s))
+    return float(m.group(0)) if m else None
+
+
+def _normalize_credits(raw: str) -> float | None:
+    """A printed credit figure: "25.944" -> 25.944. A comma read in place of
+    the decimal point ("25,944") is taken as one, since these are never in
+    the thousands."""
+    s = raw.replace(",", ".")
+    # A leading-point figure (".5", as Kauswagan prints half a day) has to be
+    # matched whole — a plain digit run would read it as 5.
+    m = re.search(r"\d*\.\d+|\d+", s)
+    return float(m.group(0)) if m else None
+
+
+def vsc_days(hours: float, factor: float = VSC_CONVERSION_FACTOR) -> float:
+    """VSC days = hours x factor / 8, to the 3 decimals the ledger keeps."""
+    return round(hours * factor / HOURS_PER_DAY, 3)
+
+
+# The most credit one calendar day can possibly earn: 24 hours at x1.50.
+MAX_VSC_DAYS_PER_CALENDAR_DAY = 24 * VSC_CONVERSION_FACTOR / HOURS_PER_DAY
+
+
+def _resolve_vsc_credits(
+    hours: float | None, printed: float | None, period_days: int | None = None,
+) -> tuple[float | None, str | None]:
+    """_resolve_vsc_credits_unbounded, then refused outright if the result is
+    more than the period could physically earn. A lost decimal point turns
+    7.21 into 721 — a figure that flagging alone would still leave prefilled
+    and ticked for submission."""
+    earned, warning = _resolve_vsc_credits_unbounded(hours, printed)
+    if earned is not None and period_days:
+        ceiling = period_days * MAX_VSC_DAYS_PER_CALENDAR_DAY
+        if earned > ceiling:
+            return None, (
+                f"Credits read as {earned:g} — more than a {period_days}-day period can earn "
+                f"(at most {ceiling:g} even at 24 hours a day). Likely a misread; enter it from the paper."
+            )
+    return earned, warning
+
+
+def _resolve_vsc_credits_unbounded(hours: float | None, printed: float | None) -> tuple[float | None, str | None]:
+    """The credit to record for one row, and a warning when it needs a look.
+
+    The printed figure is what the special order grants, so it is what gets
+    recorded — and offices work it out differently: one at 0.188 per hour,
+    one truncating to half-days, one below the formula by varying amounts.
+    Checking for an exact match with hours x 1.50 / 8 would flag nearly every
+    correct row of those orders, and a flag on everything gets ignored.
+
+    What does hold across all of them is that a grant never exceeds what the
+    hours can earn at x1.50 — while OCR misreads push the other way (a 5 read
+    as a 9, a lost decimal point). So the hours are an upper bound, not a
+    target. Downward misreads are caught separately, by reading the cell more
+    than one way (_consensus_credits)."""
+    if printed is None:
+        ceiling = f" (at most {vsc_days(hours):g} for {hours:g} hours at x{VSC_CONVERSION_FACTOR:.2f})" if hours is not None else ""
+        # Not computed and filled in: the formula is exactly what these
+        # offices *don't* consistently use, so it would be a guess.
+        return None, f"Credits granted couldn't be read — enter the figure from the paper{ceiling}."
+    if hours is None:
+        return printed, "Hours served couldn't be read, so the credits granted weren't checked against them."
+    # The rounded hourly rate (0.188) sits a hair above the exact one (0.1875)
+    # and is used in practice, so it is the ceiling.
+    ceiling = hours * round(VSC_CONVERSION_FACTOR / HOURS_PER_DAY, 3) + 0.0015
+    if printed > ceiling:
+        # Not filled in, even flagged: no office can grant more than the hours
+        # earn, so this is a misread — and a prefilled misread stays ticked.
+        return None, (
+            f"Credits granted read as {printed:g} — more than {hours:g} hours can earn at "
+            f"x{VSC_CONVERSION_FACTOR:.2f} ({vsc_days(hours):g}). Likely a misread; enter it from the paper."
+        )
+    return printed, None
+
+
+def vsc_ceiling(hours: float | None) -> float | None:
+    """The most credit `hours` can earn, at the rounded rate some offices use."""
+    if hours is None:
+        return None
+    return hours * round(VSC_CONVERSION_FACTOR / HOURS_PER_DAY, 3) + 0.0015
+
+
+def _consensus_credits(reads: list[str], ceiling: float | None = None) -> tuple[float | None, str | None]:
+    """Settle a printed credit figure from several independent OCR reads.
+
+    Filled in only when a strict majority of the readable reads agree *and*
+    that value fits under what the hours can earn. The hours can veto a
+    reading, but never pick one: they are OCR'd too. Uy's "9 HRS" read as 5
+    made the paper's 1.5 look impossible, and letting the hours choose among
+    the readings filled in a wrong 1. So any disagreement the majority can't
+    settle within the ceiling is left blank — with a hint naming the reading
+    that does fit, since that one is usually right and easy to confirm."""
+    values = [v for v in (_normalize_credits(r) for r in reads) if v is not None]
+    if not values:
+        return None, None
+    votes = Counter(values)
+    if len(votes) == 1:
+        return values[0], None
+    options = " or ".join(f"{v:g}" for v, _ in votes.most_common())
+    (top, top_votes), (_, runner_up) = votes.most_common(2)
+    if top_votes > runner_up and (ceiling is None or top <= ceiling):
+        return top, (
+            f"OCR disagreed on the credits granted ({options}) — the more common reading "
+            "is filled in; check it against the paper."
+        )
+    hint = ""
+    if ceiling is not None:
+        fits = [v for v in votes if v <= ceiling]
+        if len(fits) == 1:
+            hint = f" Only {fits[0]:g} fits the hours served."
+    return None, f"OCR disagreed on the credits granted ({options}) — enter it from the paper.{hint}"
+
+
+def _period_from_dates(raw: str, default_year: int | None) -> tuple[str | None, str | None, str | None]:
+    """A grant's Inclusive Dates is one period ("May 6 to June 2, 2026"), not
+    a list of absence days — the first and last dates mentioned bound it."""
+    short = re.findall(r"\b(\d{1,2})-(\d{1,2})-(\d{2}|\d{4})\b", raw)
+    if short and not _MONTH_IN_TEXT_RE.search(raw):
+        # "1-31-26, 2-7-26": month-day-year with a two-digit year. These list
+        # the separate days worked; the grant's period runs first to last.
+        dates = []
+        for m, d, y in short:
+            year = int(y) + 2000 if len(y) == 2 else int(y)
+            try:
+                dates.append(date(year, int(m), int(d)))
+            except ValueError:
+                return None, None, f"Invalid date parsed from {raw!r} — enter manually."
+        warning = None
+    elif _MONTH_IN_TEXT_RE.search(raw):
+        runs, warning = _parse_date_segments_monthname(raw, default_year)
+        dates = [d for f, t, _ in runs for d in (f, t)]
+    else:
+        segments, warning = _parse_date_segments_numeric(raw)
+        dates = [d for f, t in segments for d in (f, t)]
+    if not dates:
+        return None, None, warning or f"Could not parse dates from {raw!r} — enter manually."
+    return min(dates).isoformat(), max(dates).isoformat(), None
+
+
+def _extract_vsc_row(
+    img: np.ndarray, cells: dict[str, list[tuple[str, tuple[int, int, int, int]]]],
+    default_year: int | None, seq: int,
+) -> list[Form6Row]:
+    def read_all(field: str, psm: int, whitelist: str | None) -> str:
+        # A pen tick or margin line through a column can split one cell into
+        # two boxes; reading them left to right keeps the whole value.
+        return " ".join(
+            _ocr_cell(img, box, psm, whitelist).strip() for _, box in cells.get(field) or []
+        ).strip()
+
+    last_name, first_name, middle_initial = _split_any_name(read_all("name", 6, None))
+    if not last_name or not first_name:
+        return []
+
+    # psm 6: "31 HOURS & 37 MINUTES" wraps over three lines in its cell.
+    hours = _normalize_hours(read_all("hours", 6, None))
+    credit_boxes = [box for _, box in cells.get("credits") or []]
+    credit_wl = "0123456789.,"
+    printed, credits_warning = _consensus_credits([
+        " ".join(_ocr_cell(img, b, 7, credit_wl) for b in credit_boxes),
+        " ".join(_ocr_cell(img, b, 6, credit_wl) for b in credit_boxes),
+        " ".join(_ocr_cell_plain(img, b, 7, credit_wl) for b in credit_boxes),
+    ], vsc_ceiling(hours))
+    if hours is None and printed is None and not credits_warning:
+        # No figures at all: a header remnant or a note row, not a grant.
+        return []
+
+    # The same two-pass read as a leave row's dates: a whitelist without "/"
+    # would turn "02/07/2026" into "02072026".
+    dates_raw = _ocr_date_cell(img, cells["dates"][0][1])[0] if cells.get("dates") else ""
+    date_from, date_to, date_warning = _period_from_dates(dates_raw, default_year)
+    period_days = (
+        (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1 if date_from else None
+    )
+    earned, warning = _resolve_vsc_credits(hours, printed, period_days)
+    if credits_warning:
+        warning = credits_warning if earned is None or not warning else f"{credits_warning} {warning}"
+
+    row_no = _normalize_digits(read_all("no", 7, None))
+    if not row_no.isdigit():
+        row_no = str(seq)
+
+    period = _format_period(date_from, date_to) if date_from else ""
+    description = "Vacation service credits" + (f" {period}" if period else "")
+    if hours is not None:
+        description += f" ({hours:g} hrs)"
+
+    return [Form6Row(
+        row_no=row_no,
+        last_name=last_name,
+        first_name=first_name,
+        middle_initial=middle_initial,
+        position_raw=_normalize_position(read_all("position", 7, None)),
+        dates_raw=dates_raw,
+        days_raw="",
+        leave_type="VSC",
+        action_taken="",
+        date_from=date_from,
+        date_to=date_to,
+        description=description,
+        used="",
+        parse_warning=" ".join(w for w in (date_warning, warning) if w) or None,
+        # Ticked for submission only when something corroborates the figure:
+        # the hours it was checked against, or at least a period that bounded
+        # it. A lone number read off a scan with neither isn't pre-ticked.
+        in_scope=earned is not None and (hours is not None or period_days is not None),
+        kind="vsc",
+        hours=hours,
+        earned=_format_used(earned) if earned is not None else "",
+    )]
 
 
 def _extract_mapped_row(
@@ -1080,6 +1552,9 @@ def _extract_mapped_row(
     for label, box in zip(labels, row_boxes):
         if label:
             cells.setdefault(label, []).append(("", box))
+
+    if cells.get("hours") or cells.get("credits"):
+        return _extract_vsc_row(img, cells, default_year, seq)
 
     def read(field: str, psm: int, whitelist: str | None, index: int = 0) -> str:
         entries = cells.get(field) or []
@@ -1116,22 +1591,21 @@ def _extract_mapped_row(
         read("days", 6, _COMBINED_DATES_WHITELIST) if not has_dates_col
         else read("days", 7, None)
     )
-    dates_raw = _ocr_date_cell(img, cells["dates"][0][1]) if has_dates_col else days_raw
+    date_halves = 0
+    if has_dates_col:
+        dates_raw, date_halves = _ocr_date_cell(img, cells["dates"][0][1])
+    else:
+        dates_raw = days_raw
 
-    leave_type = _normalize_leave_type(read("type", 6, _WORD_OR_CODE_WHITELIST))
-    action_taken = _normalize_action(read("action", 6, _WORD_OR_CODE_WHITELIST))
-    if not leave_type and "-" in (raw_action := read("action", 6, _WORD_OR_CODE_WHITELIST)):
-        # A single Remarks column can carry both, combined ("SL-WP").
-        leave_type, action_taken = _split_combined_remarks(raw_action)
-    if leave_type not in _LEAVE_TYPE_LABELS:
-        if action_taken not in ("WP", "WOP"):
-            # Neither column says anything a leave form would say — this is
-            # some other table that happens to have people's names in it.
-            return []
-        # A form with no Type column at all (it prints only "w/ pay") — see
-        # the note in the README: these are recorded as sick leave, which is
-        # what they are in practice, and stay visible for review.
-        leave_type = "SL"
+    raw_action = read("action", 6, _WORD_OR_CODE_WHITELIST)
+    leave_type, action_taken = _resolve_leave_type(
+        read("type", 6, _WORD_OR_CODE_WHITELIST) if cells.get("type") else None,
+        raw_action,
+    )
+    if leave_type not in _LEAVE_TYPE_LABELS and action_taken not in ("WP", "WOP"):
+        # Neither column says anything a leave form would say — this is some
+        # other table that happens to have people's names in it.
+        return []
 
     used_override: float | None
     if has_dates_col:
@@ -1139,8 +1613,14 @@ def _extract_mapped_row(
             runs, warning = _parse_date_segments_monthname(dates_raw, default_year)
             segments, per_run_used = [(f, t) for f, t, _ in runs], [u for _, _, u in runs]
         else:
-            segments, warning = _parse_date_segments_numeric(dates_raw)
+            dates_raw, segments, warning = _read_numeric_dates(img, cells["dates"][0][1], dates_raw)
             per_run_used = []
+            if date_halves and len(segments) == 1:
+                # "7/7PM/2026": a half day the numeric format can only mark
+                # with letters. Counted here so it cross-checks the printed
+                # day count instead of silently deferring to it.
+                f, t = segments[0]
+                per_run_used = [max(0.5, (t - f).days + 1 - 0.5 * date_halves)]
         used_override = _normalize_total_days(days_raw)
     else:
         runs, used_override, warning = _parse_date_segments_combined(days_raw)
@@ -1412,31 +1892,197 @@ def _load_pages(path: str) -> list[np.ndarray]:
     return [img]
 
 
-def _extract_page(
-    img: np.ndarray, seq_start: int, header: tuple[dict[int, str], list[tuple[int, int, int, int]]] | None = None
-) -> tuple[list[Form6Row], int, Counter[int], tuple[dict[int, str], list[tuple[int, int, int, int]]] | None]:
+def _resolve_leave_type(type_raw: str | None, raw_action: str) -> tuple[str, str]:
+    """(leave type, action) for one row. `type_raw` is None when the form has
+    no Type of Leave column at all.
+
+    Only that case assumes sick leave — a form printing just "w/ pay" means
+    sick leave in practice (see the README). A type the form *does* print is
+    kept exactly as read, even one this tool doesn't record: relabelling
+    "SOLO P" as sick leave would file the wrong leave against someone."""
+    action = _normalize_action(raw_action)
+    if type_raw is not None:
+        return _normalize_leave_type(type_raw), action
+    if "-" in raw_action:
+        # One Remarks column carrying both, combined ("SL-WP").
+        return _split_combined_remarks(raw_action)
+    return ("SL" if action in ("WP", "WOP") else ""), action
+
+
+# ---------------------------------------------------------------------------
+# Column grid
+#
+# Grid-line detection occasionally misses one border, and a row then arrives
+# a cell short — an Action cell gone means its WP/WOP is gone and the row
+# comes through unticked. The columns themselves sit at the same x on every
+# row of a printed table, so the grid those rows agree on is used to put the
+# missing cell back.
+# ---------------------------------------------------------------------------
+
+Box = tuple[int, int, int, int]
+
+
+def _column_grid(grouped: list[list[Box]]) -> list[tuple[int, int]] | None:
+    """Column x-ranges (left, right) the table's most common row shape agrees
+    on, or None when there aren't enough complete rows to trust."""
+    counts = Counter(len(r) for r in grouped if len(r) > 1)
+    if not counts:
+        return None
+    width, seen = counts.most_common(1)[0]
+    if seen < 3:
+        return None
+    rows = [r for r in grouped if len(r) == width]
+    grid = []
+    for i in range(width):
+        lefts = sorted(r[i][0] for r in rows)
+        rights = sorted(r[i][0] + r[i][2] for r in rows)
+        grid.append((lefts[len(lefts) // 2], rights[len(rights) // 2]))
+    return grid
+
+
+def _fill_row_to_grid(row: list[Box], grid: list[tuple[int, int]]) -> list[Box]:
+    """Put back any cell a short row lost, cut from its column's x-range and
+    the row's own height. Rows that already have every column — or more,
+    like a header whose one cell spans several — are returned untouched."""
+    if len(row) >= len(grid) or len(row) < len(grid) // 2:
+        return row
+    y = sorted(b[1] for b in row)[len(row) // 2]
+    h = sorted(b[3] for b in row)[len(row) // 2]
+    filled = list(row)
+    for left, right in grid:
+        covered = any(
+            min(bx + bw, right) - max(bx, left) >= 0.5 * min(bw, right - left)
+            for bx, _, bw, _ in row
+        )
+        if not covered:
+            filled.append((left, y, right - left, h))
+    return sorted(filled, key=lambda b: b[0])
+
+
+# ---------------------------------------------------------------------------
+# Content-based column inference
+#
+# A continuation page repeats the table but not its header, and reading the
+# header is how columns get their meaning. Rather than guess a layout from
+# how many columns there are, look at what each column actually holds: a
+# column of "7/3/2026" is dates, "1 DAY" is a day count, "SL" or "SOLO P" is
+# the leave type, "WP" is the action. That needs no knowledge of any
+# particular school's layout, so a headerless page of a new form reads too.
+# ---------------------------------------------------------------------------
+
+_NUMERIC_DATE_RE = re.compile(r"\d{1,2}\s*[/\[\]{}()|\\]\s*\d{1,2}.*20\d{2}")
+_DAYS_CELL_RE = re.compile(r"^\s*(?:\d+(?:\.\d)?|[|lI!]|half|½)\s*days?\b", re.IGNORECASE)
+_POSITION_RE = re.compile(r"^(?:SPET|MT|HT|T|TEACHER|MASTER\s*TEACHER)\s*[-_]?\s*[IVX1L|!]+$", re.IGNORECASE)
+
+
+def _classify_cell(text: str) -> str | None:
+    """What kind of value one cell holds, judged only by its text."""
+    t = " ".join(text.split())
+    if not t:
+        return None
+    if re.search(r"\d\s*(?:HRS?|HOURS?|MIN(?:UTE)?S?)\b", t, re.IGNORECASE):
+        return "hours"
+    if re.fullmatch(r"\d{1,3}[.,]\d{2,3}", t):
+        return "credits"
+    if _DAYS_CELL_RE.search(t):
+        return "days"
+    if _NUMERIC_DATE_RE.search(t) or (_MONTH_IN_TEXT_RE.search(t) and re.search(r"\d", t)):
+        return "dates"
+    if "," in t and len(re.findall(r"[A-Za-z]{2,}", t)) >= 2:
+        return "name"
+    if _POSITION_RE.match(t.replace(" ", "")):
+        return "position"
+    if _normalize_leave_type(t) in _LEAVE_TYPE_LABELS:
+        return "type"
+    if len(t) <= 12 and _normalize_action(t) in ("WP", "WOP"):
+        return "action"
+    if re.fullmatch(r"[\dlI|]{1,3}[.)]?", t):
+        return "no"
+    # A name with no comma ("Kenneth Joh Conde", "Krezel Marie M. Salva") —
+    # the order a grant form prints. Only after position, type and action have
+    # had their turn, since "Teacher I" and "Sick Leave" are also two words.
+    words = re.findall(r"[A-Za-z]{2,}", t)
+    if len(words) >= 2 and not re.search(r"\d", t) and len(re.sub(r"[A-Za-z .'-]", "", t)) == 0:
+        return "name"
+    return None
+
+
+def _labels_from_samples(columns: list[list[str]]) -> list[str | None] | None:
+    """Label each column from sample texts of its cells (one list per column,
+    left to right). A column takes the kind most of its readable cells agree
+    on. None when the result doesn't describe a leave table — no person and
+    no date means this isn't one, and guessing would be worse than the fixed
+    fallback layouts."""
+    labels: list[str | None] = []
+    for samples in columns:
+        kinds = [k for k in (_classify_cell(s) for s in samples) if k]
+        if not kinds:
+            labels.append(None)
+            continue
+        kind, votes = Counter(kinds).most_common(1)[0]
+        labels.append(kind if votes * 2 >= len(kinds) else None)
+    # A grant's hours column is a plain whole number, which reads just like a
+    # row number. When there's a credits column, the leftmost number column is
+    # the row number and any other is the hours.
+    if "credits" in labels:
+        numbered = [i for i, label in enumerate(labels) if label == "no"]
+        for i in numbered[1:]:
+            labels[i] = "hours"
+    found = set(labels)
+    if "name" not in found or not found & {"dates", "days"}:
+        return None
+    return labels
+
+
+def _infer_header_from_content(img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]]):
+    """Build a header mapping for a page with no readable header row, in the
+    same shape _map_header_row returns, from a sample of its data rows."""
+    rows = [r for r in grouped if len(r) == len(grid)]
+    if len(rows) < 2:
+        return None
+    # A spread of rows, not just the first few: one odd row shouldn't decide.
+    step = max(1, len(rows) // 6)
+    sample = rows[::step][:6]
+    columns = [[_ocr_cell(img, row[i], 6, None).strip() for row in sample] for i in range(len(grid))]
+    labels = _labels_from_samples(columns)
+    if not labels:
+        return None
+    header_boxes = [(left, 0, right - left, 1) for left, right in grid]
+    mapping = {box[0]: label for box, label in zip(header_boxes, labels) if label}
+    return mapping, header_boxes
+
+
+def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int, Counter[int]]:
     """Run the full per-page pipeline (table detection through row
     extraction) on one page image. Returns (rows, next seq_start, counts of
-    rows no layout could read, the header mapping to carry forward) — seq is
-    the running row-number counter for layouts with no row-number column,
-    threaded across pages so numbering stays continuous in a multi-page PDF.
+    rows no layout could read) — seq is the running row-number counter for
+    layouts with no row-number column, threaded across pages so numbering
+    stays continuous in a multi-page PDF.
 
-    `header` is the mapping read from an earlier page: a continuation page of
-    a long transmittal usually repeats the table but not its header row, so
-    the one already found keeps being used."""
+    Columns get their meaning from, in order: the page's own header row; the
+    content of its cells, for a continuation page with no header; and only
+    then the fixed layouts this tool knew before either. Nothing is carried
+    over from an earlier page — every page is dewarped to its own size and
+    offset, so column positions from one don't line up with the next."""
     default_year = _detect_default_year(img)
     warped = _dewarp_table(img)
     boxes = _find_cell_boxes(warped)
     grouped = [sorted(row, key=lambda b: b[0]) for row in _group_into_rows(boxes)]
 
+    grid = _column_grid(grouped)
+    if grid:
+        grouped = [_fill_row_to_grid(row, grid) for row in grouped]
+
     # Read the column labels off the form itself. Only the first few rows are
     # considered — a header is at the top, and a data row that happens to
     # contain a word shouldn't be mistaken for one further down.
+    header = None
     for candidate in grouped[:3]:
-        mapping = _map_header_row(warped, candidate)
-        if mapping:
-            header = (mapping, candidate)
+        header = _map_header_row(warped, candidate, grid)
+        if header:
             break
+    if header is None and grid:
+        header = _infer_header_from_content(warped, grouped, grid)
 
     results: list[Form6Row] = []
     seq = seq_start
@@ -1474,43 +2120,55 @@ def _extract_page(
             # "0 rows" — only ever read when the document yielded nothing.
             unmatched[len(row_boxes)] += 1
 
-    return results, seq, unmatched, header
+    return results, seq, unmatched
 
 
-def extract_form6(image_path: str) -> list[Form6Row]:
-    """Extract every data row from a Form 6 transmittal into draft Form6Row
-    objects. Accepts a photo/scan (JPG, PNG, ...) or a PDF — a PDF's pages
-    are each rasterized and processed the same way, in order. Does not
-    filter by leave type/action — use `row.in_scope` (True for Type of
-    Leave == SL and Action Taken in {WP, WOP}, matching this project's
-    standing sick-leave-entry convention) or filter yourself in the caller.
+# A page yielding nothing, or losing most of its rows, is reported rather than
+# skipped. A few dropped rows are normal — the header, a blank line — so only
+# more than that counts.
+_DROPPED_ROWS_WORTH_NOTING = 3
 
-    A non-contiguous leave cell (e.g. "June 8-11, 22-23") becomes multiple
-    Form6Row entries, one per contiguous date range — a leave record can
-    only carry a single start/end date, so this is the only way to keep
-    every real date range submittable on its own.
 
-    Supports five table layouts, dispatched purely by how many columns a
-    detected row has (3, 5, 6, 7 or 9) — see _extract_3col_row and friends.
-    """
+def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]]:
+    """extract_form6, plus notes on anything the reader couldn't read that the
+    user needs to know about.
+
+    The rows alone can't say what's missing. A continuation page whose table
+    didn't detect cleanly used to contribute nothing at all to an otherwise
+    successful upload — ten teachers' grants, gone without a word, because the
+    "couldn't read this table" error only fires when the whole document
+    yields nothing."""
     pages = _load_pages(image_path)
 
     results: list[Form6Row] = []
+    notes: list[str] = []
     seq = 0
-    header = None
     errors: list[str] = []
     unmatched: Counter[int] = Counter()
     for i, img in enumerate(pages, start=1):
         try:
-            page_results, seq, page_unmatched, header = _extract_page(img, seq, header)
-            unmatched.update(page_unmatched)
+            page_results, seq, page_unmatched = _extract_page(img, seq)
         except ValueError as e:
             # A page with no detectable table (e.g. a PDF cover/signature
             # page) shouldn't abort a multi-page document — skip it, but
             # surface the reason if it turns out no page had a table at all.
             errors.append(f"page {i}: {e}")
             continue
+        unmatched.update(page_unmatched)
         results.extend(page_results)
+
+        dropped = sum(page_unmatched.values())
+        where = f"Page {i}" if len(pages) > 1 else "This page"
+        if not page_results and dropped >= _DROPPED_ROWS_WORTH_NOTING:
+            notes.append(
+                f"{where}: found a table with {dropped} rows but couldn't read any of them. "
+                "Nothing from this page is in the review table — enter its rows by hand."
+            )
+        elif page_results and dropped >= _DROPPED_ROWS_WORTH_NOTING:
+            notes.append(
+                f"{where}: {dropped} table rows couldn't be read and aren't in the review table. "
+                "Count this page's rows against the paper."
+            )
 
     if not results:
         if unmatched:
@@ -1521,7 +2179,15 @@ def extract_form6(image_path: str) -> list[Form6Row]:
             )
         if errors:
             raise ValueError("; ".join(errors))
-    return results
+    return results, notes
+
+
+def extract_form6(image_path: str) -> list[Form6Row]:
+    """Extract every data row from a Form 6 transmittal — or a vacation
+    service credit grant — into draft Form6Row objects. Accepts a photo/scan
+    or a PDF, whose pages are each processed in order. See
+    extract_form6_with_notes for what couldn't be read."""
+    return extract_form6_with_notes(image_path)[0]
 
 
 def _demo() -> None:
@@ -1530,8 +2196,17 @@ def _demo() -> None:
     if len(sys.argv) < 2:
         print("Usage: python ocr_form6.py <path-to-form6-image>")
         sys.exit(1)
-    rows = extract_form6(sys.argv[1])
+    rows, notes = extract_form6_with_notes(sys.argv[1])
+    for note in notes:
+        print(f"[NOTE] {note}")
     for r in rows:
+        if r.kind == "vsc":
+            warn = f"  [!] {r.parse_warning}" if r.parse_warning else ""
+            print(
+                f"{r.row_no:>3} {r.last_name}, {r.first_name} {r.middle_initial} "
+                f"({r.position_raw}) — {r.description} — earned={r.earned} [VSC]{warn}"
+            )
+            continue
         flag = "" if r.in_scope else "  (skipped — not SL/WP/WOP)"
         warn = f"  [!] {r.parse_warning}" if r.parse_warning else ""
         print(

@@ -1,5 +1,7 @@
 """
-Local desktop app for DepEd HRIS sick-leave entry.
+HRIS Service Credit Tool — a local desktop app for recording DepEd HRIS
+Service Credit entries: leave deducted from it, and vacation service credits
+earned into it.
 
 Run this on your own computer:
 
@@ -12,10 +14,13 @@ your machine: the server here just relays requests to the real HRIS API
 (v2.depedcdo.online), the same one the HRIS website itself uses. Nothing is
 sent to me or to any third party.
 
-Two ways to add entries:
-  - Search an employee by name and fill in one record by hand.
-  - Upload a scanned Form 6 transmittal — it gets OCR'd into a draft table
-    you review and correct before anything is submitted (see ocr_form6.py).
+Ways to add entries:
+  - Upload a scanned Form 6 transmittal (leave, deducted) or a vacation
+    service credit special order (credits, earned) — each on its own tab. It
+    gets OCR'd into a draft table you review and correct before anything is
+    submitted (see ocr_form6.py).
+  - Record one entry by hand: leave from the Individual Employee tab, a
+    credit grant from the Service Credits Earned tab.
 
 Submission is live (SUBMIT_ENABLED below) — confirmed against a real
 captured HRIS request on 2026-09-10. You'll always get a confirmation
@@ -33,7 +38,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 
-from ocr_form6 import extract_form6
+from ocr_form6 import extract_form6_with_notes
 
 from hris_client import BASE_URL, HrisClient, HrisError, LEAVE_CREDIT_TYPE_IDS
 
@@ -67,7 +72,7 @@ PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HRIS Leave Tool (local)</title>
+<title>HRIS Service Credit Tool (local)</title>
 <style>
   /* Design tokens from Design/DESIGN (5).md — DepEd institutional palette:
      navy authority, amber agency accent, slate neutrals, low-radius geometry. */
@@ -250,13 +255,13 @@ PAGE = """
   tbody tr:hover td { background: var(--subtle); }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums;
                    font-weight: 600; color: var(--text); }
-  #form6Table td { vertical-align: top; }
-  #form6Table input { height: 32px; font-size: 0.8125rem; }
-  #form6Table input[type=date] { min-width: 126px; }
-  #form6Table td.name-cell { min-width: 168px; }
-  #form6Table td.match-cell { min-width: 232px; }
-  #form6Table tbody tr.needs-attention td { background: var(--warn-bg); }
-  #form6Table tbody tr.row-done td { opacity: 0.5; }
+  .review-table td { vertical-align: top; }
+  .review-table input { height: 32px; font-size: 0.8125rem; }
+  .review-table input[type=date] { min-width: 126px; }
+  .review-table td.name-cell { min-width: 168px; }
+  .review-table td.match-cell { min-width: 232px; }
+  .review-table tbody tr.needs-attention td { background: var(--warn-bg); }
+  .review-table tbody tr.row-done td { opacity: 0.5; }
   .rowno { color: var(--text-muted); font-variant-numeric: tabular-nums; font-weight: 600; }
   .scan-name { font-weight: 600; color: var(--text); }
   .scan-meta { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; margin-top: 3px; }
@@ -343,11 +348,11 @@ PAGE = """
   /* Rows resolve a few at a time, so a settling flash is what makes the
      progress visible on the table itself, not just in the status line. */
   @keyframes settle { from { background: var(--ok-bg); } to { background: transparent; } }
-  #form6Table tbody tr.just-matched td { animation: settle 1.2s ease-out; }
+  .review-table tbody tr.just-matched td { animation: settle 1.2s ease-out; }
   @media (prefers-reduced-motion: reduce) {
     .spinner { animation-duration: 2.4s; }
     .progress.indeterminate > div { animation: none; width: 100%; opacity: 0.4; }
-    #form6Table tbody tr.just-matched td { animation: none; }
+    .review-table tbody tr.just-matched td { animation: none; }
   }
 
   /* A spinner sitting inside a filled button or on a coloured row needs its
@@ -421,8 +426,8 @@ PAGE = """
   <div class="login-brand">
     {{ logo() }}
     <div class="brand-text">
-      <h1>DepEd HRIS Leave Credit Tool</h1>
-      <p>Division Office Automated Leave Ledger System</p>
+      <h1>DepEd HRIS Service Credit Tool</h1>
+      <p>Division Office ledger for leave taken and credits earned</p>
     </div>
   </div>
   <div class="card">
@@ -453,8 +458,8 @@ PAGE = """
       <div class="brand">
         {{ logo() }}
         <div class="brand-text">
-          <h1>DepEd HRIS Leave Credit Tool</h1>
-          <p>Division Office Automated Leave Ledger System</p>
+          <h1>DepEd HRIS Service Credit Tool</h1>
+          <p>Division Office ledger for leave taken and credits earned</p>
         </div>
         <span class="ver">v{{ version }}</span>
       </div>
@@ -480,6 +485,9 @@ PAGE = """
       <button class="tab" role="tab" data-tab="batch" aria-selected="true">
         Form 6 OCR Batch Upload<span class="pill-primary">Primary</span>
       </button>
+      <button class="tab" role="tab" data-tab="vsc" aria-selected="false">
+        Service Credits Earned (VSC)
+      </button>
       <button class="tab" role="tab" data-tab="employee" aria-selected="false">
         Individual Employee Search &amp; Record
       </button>
@@ -495,6 +503,77 @@ PAGE = """
 <div id="sessionBanner" class="session-banner">
   Your session has expired. <a href="/">Log in again.</a>
 </div>
+
+{% macro review_workspace(p, title, button, kpi4_label, kpi4_foot, amount_header) %}
+  <div class="card">
+    <h4>{{ title }}</h4>
+    {{ caller() }}
+    <div class="field-row" style="align-items:flex-end">
+      <div style="flex:2"><input type="file" id="{{ p }}File" accept="image/*,application/pdf"></div>
+      <div style="flex:none"><button id="{{ p }}Upload" type="button" class="primary">{{ button }}</button></div>
+    </div>
+    <div id="{{ p }}Status" class="sub" style="margin-bottom:0"></div>
+    <div id="{{ p }}Notes"></div>
+  </div>
+
+  <div class="kpis" id="{{ p }}Kpis" style="display:none">
+    <div class="kpi k-navy">
+      <div class="k-label">Identified personnel</div>
+      <div class="k-value" id="{{ p }}KpiPeople">0</div>
+      <div class="k-foot" id="{{ p }}KpiPeopleFoot">From 0 rows</div>
+    </div>
+    <div class="kpi k-navy">
+      <div class="k-label">Auto-matched HRIS</div>
+      <div class="k-value" id="{{ p }}KpiAuto">0</div>
+      <div class="k-foot" id="{{ p }}KpiAutoFoot">Resolved to one employee</div>
+    </div>
+    <div class="kpi k-amber">
+      <div class="k-label">Needs attention</div>
+      <div class="k-value" id="{{ p }}KpiAttention">0</div>
+      <div class="k-foot">Requires manual alignment</div>
+    </div>
+    <div class="kpi {{ 'k-err' if p == 'form6' else 'k-navy' }}">
+      <div class="k-label">{{ kpi4_label }}</div>
+      <div class="k-value" id="{{ p }}Kpi4">0</div>
+      <div class="k-foot">{{ kpi4_foot }}</div>
+    </div>
+  </div>
+
+  <div class="card" id="{{ p }}ReviewCard" style="display:none">
+    <h4>Review draft entries</h4>
+    <p class="sub">Match each row to the right HRIS employee before submitting — the name
+    read from the scan is a starting point, not a guarantee. Unmatched or unchecked rows
+    are skipped.</p>
+    <div class="summary" id="{{ p }}Summary"></div>
+
+    <div class="table-scroll">
+    <table id="{{ p }}Table" class="review-table">
+      <thead><tr>
+        <th style="width:34px"><input type="checkbox" id="{{ p }}CheckAll" title="Check / uncheck every visible row"></th>
+        <th style="width:34px">#</th>
+        <th>Name on scan / designation</th>
+        <th>Matched HRIS record</th>
+        <th>Description</th>
+        <th>Start</th>
+        <th>End</th>
+        <th class="num">{{ amount_header }}</th>
+        <th>Status</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+    <p class="sub" id="{{ p }}Empty" style="display:none">No rows match this filter.</p>
+
+    <div class="actionbar">
+      <div class="grow">
+        <div class="bar-title" id="{{ p }}BarTitle">Batch ready for ledger commit</div>
+        <div class="progress" id="{{ p }}Progress"><div></div></div>
+        <div class="stat" id="{{ p }}SubmitStatus"></div>
+      </div>
+      <button id="{{ p }}SubmitAll" type="button" class="primary">Submit checked rows</button>
+    </div>
+  </div>
+{% endmacro %}
 
 <!-- ===================== Form 6 batch tab ===================== -->
 <section id="tab-batch" role="tabpanel">
@@ -517,78 +596,90 @@ PAGE = """
     <span class="meta-chip" id="ocrEngineChip">OCR engine: <b>checking…</b></span>
   </div>
 
-  <div class="card">
-    <h4>Upload a Form 6 transmittal</h4>
+  {% call review_workspace("form6", "Upload a Form 6 transmittal", "Read Form 6",
+                            "Without pay (WOP)", "Routed to the wo_pay column", "Days") %}
     <p class="sub">A photo or scan (JPG/PNG) or a multi-page PDF. It is read into a
     draft table for you to review and correct — nothing reaches HRIS until you submit.
-    Sick-leave rows (with or without pay) are pre-checked.</p>
+    Sick-leave rows (with or without pay) are pre-checked. Every row <b>deducts</b>:
+    paid leave from <b>used</b>, leave without pay into <b>wo_pay</b>.</p>
     <p class="sub" style="margin-bottom:0.85rem"><b>Count the rows against the paper.</b>
     Only rows inside the table's printed borders can be read — a row written in by hand
     below the last line is invisible to the reader and will not appear here. Add those
     from the Individual Employee tab.</p>
-    <div class="field-row" style="align-items:flex-end">
-      <div style="flex:2"><input type="file" id="form6File" accept="image/*,application/pdf"></div>
-      <div style="flex:none"><button id="form6Upload" type="button" class="primary">Read Form 6</button></div>
-    </div>
-    <div id="form6Status" class="sub" style="margin-bottom:0"></div>
-  </div>
+  {% endcall %}
+</section>
 
-  <div class="kpis" id="form6Kpis" style="display:none">
-    <div class="kpi k-navy">
-      <div class="k-label">Identified personnel</div>
-      <div class="k-value" id="kpiPeople">0</div>
-      <div class="k-foot" id="kpiPeopleFoot">From 0 transmittal rows</div>
-    </div>
-    <div class="kpi k-navy">
-      <div class="k-label">Auto-matched HRIS</div>
-      <div class="k-value" id="kpiAuto">0</div>
-      <div class="k-foot" id="kpiAutoFoot">Resolved to one employee</div>
-    </div>
-    <div class="kpi k-amber">
-      <div class="k-label">Needs attention</div>
-      <div class="k-value" id="kpiAttention">0</div>
-      <div class="k-foot">Requires manual alignment</div>
-    </div>
-    <div class="kpi k-err">
-      <div class="k-label">Without pay (WOP)</div>
-      <div class="k-value" id="kpiWop">0</div>
-      <div class="k-foot">Routed to the wo_pay column</div>
+<!-- ===================== Service credits earned tab ===================== -->
+<section id="tab-vsc" role="tabpanel" hidden>
+
+  <div class="banner">
+    <div class="grow">
+      <h4>Vacation service credits — added to <b>earned</b></h4>
+      <p class="sub" style="margin-bottom:0">
+        Every record here is a <b>Service Credit</b> entry with its days in the
+        <b>earned</b> column, never <b>used</b>. Upload a special order granting
+        vacation service credits, or record a single grant by hand.
+      </p>
     </div>
   </div>
 
-  <div class="card" id="form6ReviewCard" style="display:none">
-    <h4>Review draft entries</h4>
-    <p class="sub">Match each row to the right HRIS employee before submitting — the name
-    read from the scan is a starting point, not a guarantee. Unmatched or unchecked rows
-    are skipped.</p>
-    <div class="summary" id="form6Summary"></div>
+  {% call review_workspace("vsc", "Upload a vacation service credit special order", "Read special order",
+                           "Credits to record", "Days, across checked rows", "Earned") %}
+    <p class="sub">The table of teachers "hereby granted vacation service credits" — No. /
+    Name / Position / Inclusive Dates / No. of hours served / No. of vacation service
+    credits granted. Continuation pages without a header read too.</p>
+    <p class="sub" style="margin-bottom:0.85rem">Each row records the <b>credits granted as
+    printed</b> — offices work them out differently, so the hours are only a ceiling.
+    A figure above what the hours can earn, or one the reads don't agree on, is left
+    blank for you to enter from the paper.</p>
+  {% endcall %}
 
-    <div class="table-scroll">
-    <table id="form6Table">
-      <thead><tr>
-        <th style="width:34px"><input type="checkbox" id="form6CheckAll" title="Check / uncheck every visible row"></th>
-        <th style="width:34px">#</th>
-        <th>Name on scan / designation</th>
-        <th>Matched HRIS record</th>
-        <th>Description</th>
-        <th>Start</th>
-        <th>End</th>
-        <th class="num">Days</th>
-        <th>Status</th>
-      </tr></thead>
-      <tbody></tbody>
-    </table>
-    </div>
-    <p class="sub" id="form6Empty" style="display:none">No rows match this filter.</p>
-
-    <div class="actionbar">
-      <div class="grow">
-        <div class="bar-title" id="form6BarTitle">Batch ready for ledger commit</div>
-        <div class="progress" id="form6Progress"><div></div></div>
-        <div class="stat" id="form6SubmitStatus"></div>
+  <div class="card">
+    <h4>Record a single grant</h4>
+    <p class="sub">For one teacher, or a row the upload couldn't read.</p>
+    <div class="field">
+      <label>Employee</label>
+      <div class="match-row">
+        <input id="vscEmpQ" placeholder="Surname works best — e.g. Dela Cruz">
+        <button type="button" id="vscEmpFind" class="dense">Find</button>
       </div>
-      <button id="form6SubmitAll" type="button" class="primary">Submit checked rows</button>
+      <div id="vscEmpResults" class="match-results"></div>
+      <div id="vscEmpChosen" class="hint"></div>
     </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Hours rendered</label>
+        <input id="vscHours" type="number" step="any" min="0" placeholder="8">
+      </div>
+      <div class="field">
+        <label>Conversion factor</label>
+        <input id="vscFactor" type="number" step="0.01" min="0" value="1.50">
+        <div class="hint">&times;1.50 for work during summer or Christmas vacation, weekends or holidays.</div>
+      </div>
+      <div class="field">
+        <label>Credits earned (days)</label>
+        <input id="vscEarned" type="number" step="any" min="0.001">
+        <div class="hint" id="vscFormula">Hours &times; factor &divide; 8 — edit it to match the order.</div>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Start date</label>
+        <input id="vscFrom" type="date">
+      </div>
+      <div class="field">
+        <label>End date</label>
+        <input id="vscTo" type="date">
+      </div>
+    </div>
+    <div class="field">
+      <label>Description &amp; authority</label>
+      <input id="vscDescription" placeholder="Vacation service credits May 6 - June 2, 2026 (138 hrs)">
+    </div>
+    <button type="button" id="vscAddBtn" class="primary" style="width:100%;justify-content:center">
+      {{ 'Add credits to HRIS' if submit_enabled else 'Preview payload (dry run)' }}
+    </button>
+    <div id="vscAddResult"></div>
   </div>
 </section>
 
@@ -656,7 +747,7 @@ PAGE = """
         <h4>Add sick leave record</h4>
         <p class="sub">Direct Form 6 transaction entry.</p>
         <form id="addForm">
-          <div class="field-row">
+          <div class="field-row" id="deductFields">
             <div class="field">
               <label>Leave credit type</label>
               <select name="leave_type" disabled><option>Service Credit</option></select>
@@ -667,21 +758,7 @@ PAGE = """
               <input name="used" type="number" step="0.5" min="0.5" value="1" required>
             </div>
           </div>
-          <div class="field">
-            <label>Description &amp; authority</label>
-            <input name="description" placeholder="Sick leave September 9, 2026" required>
-          </div>
-          <div class="field-row">
-            <div class="field">
-              <label>Start date</label>
-              <input name="date_from" type="date" required>
-            </div>
-            <div class="field">
-              <label>End date</label>
-              <input name="date_to" type="date" required>
-            </div>
-          </div>
-          <div class="info-box" style="margin-bottom:0.75rem">
+          <div class="info-box" id="wopBox" style="margin-bottom:0.75rem">
             <label style="display:flex;gap:8px;align-items:flex-start;margin:0;font-weight:600">
               <input name="without_pay" type="checkbox" style="margin-top:2px">
               <span>Without pay (WOP)
@@ -755,7 +832,7 @@ function showTab(name) {
   document.querySelectorAll('.tab').forEach(t => {
     t.setAttribute('aria-selected', t.dataset.tab === name ? 'true' : 'false');
   });
-  ['batch', 'employee', 'wop'].forEach(n => {
+  ['batch', 'vsc', 'employee', 'wop'].forEach(n => {
     document.getElementById('tab-' + n).hidden = (n !== name);
   });
 }
@@ -999,8 +1076,8 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
   if (!body.description || !body.description.trim()) { showError('addResult', 'Description is required.'); return; }
   if (!body.date_from || !body.date_to) { showError('addResult', 'Both start and end dates are required.'); return; }
   if (body.date_to < body.date_from) { showError('addResult', 'End date cannot be before start date.'); return; }
-  const usedVal = parseFloat(body.used);
-  if (isNaN(usedVal) || usedVal <= 0) { showError('addResult', 'Used must be a positive number.'); return; }
+  const amount = parseFloat(body.used);
+  if (isNaN(amount) || amount <= 0) { showError('addResult', 'Days to deduct must be a positive number.'); return; }
 
   if (SUBMIT_ENABLED) {
     const ok = await confirmModal({
@@ -1043,14 +1120,19 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
 });
 
 // ---------------------------------------------------------------------
-// Form 6 batch upload / review
+// Batch upload / review — one workspace per tab
+//
+// The Form 6 tab (leave, deducted) and the Service Credits Earned tab
+// (grants, added) share every step: upload, OCR, match names against HRIS,
+// review, submit. What differs — the row's label, which column its days go
+// to, the fourth KPI, one filter, the confirmation — comes in as config, so
+// the two can't drift apart.
 // ---------------------------------------------------------------------
-let form6Rows = []; // {draft, employeeId, employeeName}
 
-// Drives the status line under the upload button during the two slow steps.
-// Returns a small handle so the caller can move the bar along and then
-// replace the whole panel with a one-line result.
-function form6Busy(target, label, total) {
+// Drives a status line during a slow step. Returns a small handle so the
+// caller can move the bar along and then replace the whole panel with a
+// one-line result.
+function busyPanel(target, label, total) {
   const determinate = typeof total === 'number';
   target.innerHTML =
     '<div class="busy"><span class="spinner"></span>' +
@@ -1082,301 +1164,19 @@ function form6Busy(target, label, total) {
   };
 }
 
-document.getElementById('form6Upload').addEventListener('click', async () => {
-  const fileInput = document.getElementById('form6File');
-  const status = document.getElementById('form6Status');
-  const uploadBtn = document.getElementById('form6Upload');
-  if (!fileInput.files.length) { status.textContent = 'Choose an image first.'; return; }
-  const busy = form6Busy(status, 'Reading the scan — dewarping the page and OCR-ing each cell...');
-  uploadBtn.disabled = true;
-  const fd = new FormData();
-  fd.append('file', fileInput.files[0]);
-  try {
-    const res = await checkedFetch('/api/ocr', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (data.error) { busy.done('Error: ' + data.error); return; }
-    form6Rows = data.rows.map(r => ({ draft: r, employeeId: null, employeeName: '' }));
-    busy.done('');
-    renderForm6Table();
-    await autoMatchForm6Rows(status);
-  } catch (err) {
-    if (err.message !== 'Session expired') busy.done('Upload failed: ' + err);
-    else busy.done('');
-  } finally {
-    uploadBtn.disabled = false;
-  }
-});
-
-let form6Filter = 'all';
-
-// Filtering hides rows rather than re-rendering them, so every row's edits,
-// tick state and loaded candidates survive switching between views.
-function form6RowEls() {
-  return [...document.querySelectorAll('#form6Table tbody tr')];
-}
-function form6VisibleRowEls() {
-  return form6RowEls().filter(tr => tr.style.display !== 'none');
-}
-function form6NeedsAttention(tr) {
-  const row = form6Rows[tr.dataset.idx];
-  return tr.querySelector('.row-check').checked &&
-         (!row.employeeId || !!row.draft.parse_warning);
+// Rows the reader couldn't read at all don't show up as rows, so they are
+// listed here — and kept on screen, unlike the status line, which the
+// matching step overwrites.
+function showNotes(box, notes) {
+  box.innerHTML = notes.length
+    ? '<div class="warn-box" style="margin-top:0.75rem"><b>Not everything on this upload could be read.</b>' +
+      '<ul style="margin:6px 0 0 1.1rem;padding:0">' +
+      notes.map(n => `<li>${escapeHtml(n)}</li>`).join('') + '</ul></div>'
+    : '';
 }
 
-document.getElementById('form6CheckAll').addEventListener('change', (e) => {
-  // Only what the user can currently see, so a tick never changes a row
-  // hidden behind a filter.
-  form6VisibleRowEls().forEach(tr => { tr.querySelector('.row-check').checked = e.target.checked; });
-  syncForm6CheckAll();
-  updateForm6Summary();
-});
-
-// Reflect the rows in the header box: ticked when all are, indeterminate
-// while only some are, so it never claims more than it means.
-function syncForm6CheckAll() {
-  const all = form6VisibleRowEls().map(tr => tr.querySelector('.row-check'));
-  const checked = all.filter(cb => cb.checked).length;
-  const box = document.getElementById('form6CheckAll');
-  box.checked = all.length > 0 && checked === all.length;
-  box.indeterminate = checked > 0 && checked < all.length;
-}
-
-function applyForm6Filter() {
-  form6RowEls().forEach(tr => {
-    const row = form6Rows[tr.dataset.idx];
-    let show = true;
-    if (form6Filter === 'attention') show = form6NeedsAttention(tr);
-    else if (form6Filter === 'wop') show = row.draft.action_taken === 'WOP';
-    else if (form6Filter === 'checked') show = tr.querySelector('.row-check').checked;
-    tr.style.display = show ? '' : 'none';
-    tr.classList.toggle('needs-attention', form6NeedsAttention(tr));
-  });
-  const none = form6VisibleRowEls().length === 0;
-  document.getElementById('form6Empty').style.display = none ? 'block' : 'none';
-  syncForm6CheckAll();
-}
-
-function updateForm6Summary() {
-  const els = form6RowEls();
-  const checked = els.filter(tr => tr.querySelector('.row-check').checked);
-  const counts = {
-    all: els.length,
-    attention: els.filter(form6NeedsAttention).length,
-    wop: els.filter(tr => form6Rows[tr.dataset.idx].draft.action_taken === 'WOP').length,
-    checked: checked.length,
-  };
-  const people = new Set(els.map(tr => form6Rows[tr.dataset.idx].employeeId).filter(Boolean)).size;
-  const box = document.getElementById('form6Summary');
-  box.innerHTML = '';
-
-  const chips = [
-    ['all', 'All rows', counts.all, ''],
-    ['checked', 'Checked for submit', counts.checked, ''],
-    ['attention', 'Needs attention', counts.attention, 'chip-warn'],
-    ['wop', 'Without pay (WOP)', counts.wop, ''],
-  ];
-  chips.forEach(([key, label, n, extra]) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'chip ' + extra;
-    b.setAttribute('aria-pressed', form6Filter === key ? 'true' : 'false');
-    b.innerHTML = `${label} <span class="n">${n}</span>`;
-    b.onclick = () => { form6Filter = key; updateForm6Summary(); };
-    box.appendChild(b);
-  });
-
-  const auto = form6Rows.filter(r => r.autoMatched).length;
-  document.getElementById('form6Kpis').style.display = els.length ? 'grid' : 'none';
-  document.getElementById('kpiPeople').textContent = people;
-  document.getElementById('kpiPeopleFoot').textContent = `From ${counts.all} transmittal rows`;
-  document.getElementById('kpiAuto').textContent = auto;
-  document.getElementById('kpiAutoFoot').textContent =
-    counts.all ? `${Math.round(auto / counts.all * 100)}% of rows resolved to one employee`
-               : 'Resolved to one employee';
-  document.getElementById('kpiAttention').textContent = counts.attention;
-  document.getElementById('kpiWop').textContent = counts.wop;
-
-  const ready = counts.checked - counts.attention;
-  document.getElementById('form6BarTitle').textContent = counts.attention
-    ? `${ready} of ${counts.checked} checked row(s) ready — ${counts.attention} need attention`
-    : `${counts.checked} checked row(s) ready for ledger commit`;
-  const submitBtn = document.getElementById('form6SubmitAll');
-  if (!submitBtn.disabled) {
-    submitBtn.textContent = `Submit checked rows (${counts.checked})`;
-    // At rest the bar shows how much of the batch is ready to commit; during a
-    // submission the loop below takes it over to show progress instead.
-    document.getElementById('form6Progress').firstElementChild.style.width =
-      counts.all ? (Math.max(ready, 0) / counts.all * 100) + '%' : '0';
-  }
-
-  applyForm6Filter();
-}
-
-function form6NameGuess(d) {
+function nameGuess(d) {
   return `${d.last_name}, ${d.first_name} ${d.middle_initial || ''}`.trim();
-}
-
-// Look every row's name up in one request. A row whose name resolves to
-// exactly one employee is matched automatically; anything ambiguous or
-// unfound is left for the user, with its candidates already on screen so
-// picking one is a single click rather than a search.
-// The slow half of an upload: one HRIS search per distinct name, dozens of
-// them, previously sent as a single request that sat silent until the whole
-// batch came back. Names now go up in small groups so the bar can move on
-// real progress and matched rows can settle into the table as they land —
-// and so a failure part-way keeps everything already matched.
-const FORM6_MATCH_CHUNK = 4;
-
-async function autoMatchForm6Rows(status) {
-  const names = [...new Set(form6Rows.map(r => form6NameGuess(r.draft)))];
-  const busy = form6Busy(status, `Matching ${names.length} name(s) against HRIS...`, names.length);
-
-  let checked = 0;
-  let auto = 0;
-  let failed = 0;
-  for (let i = 0; i < names.length; i += FORM6_MATCH_CHUNK) {
-    const chunk = names.slice(i, i + FORM6_MATCH_CHUNK);
-    let matches = {};
-    try {
-      const res = await checkedFetch('/api/match', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ names: chunk }),
-      });
-      const data = await res.json();
-      if (data.error) { failed += chunk.length; } else { matches = data.matches || {}; }
-    } catch (err) {
-      if (err.message === 'Session expired') { busy.done(''); return; }
-      failed += chunk.length;
-    }
-
-    auto += applyForm6Matches(matches);
-    checked += chunk.length;
-    busy.step(checked, `Matching names against HRIS — ${auto} linked so far...`);
-  }
-
-  const left = form6Rows.filter(r => r.draft.in_scope && !r.employeeId).length;
-  busy.done(
-    `Read ${form6Rows.length} row(s). Matched ${auto} automatically` +
-    (left ? ` — ${left} still need a pick below.` : '. Review before submitting.') +
-    (failed ? ` (${failed} name(s) couldn't be looked up — use Find on those rows.)` : '')
-  );
-  updateForm6Summary();
-}
-
-// Fold one chunk's results into the rows they belong to and update just
-// those rows in place — a full re-render would throw away any edit or tick
-// the user has already made further down the table while this runs.
-function applyForm6Matches(matches) {
-  let auto = 0;
-  form6RowEls().forEach(tr => {
-    const row = form6Rows[tr.dataset.idx];
-    const found = (matches[form6NameGuess(row.draft)] || {}).results;
-    if (!found) return;
-    row.candidates = found;
-    if (found.length === 1) {
-      row.employeeId = found[0].id;
-      row.employeeName = found[0].full_name;
-      row.autoMatched = true;
-      auto++;
-      tr.classList.add('just-matched');
-      setTimeout(() => tr.classList.remove('just-matched'), 1300);
-    }
-    setMatchState(tr, row);
-    if (!row.employeeName) showMatchOptions(tr, Number(tr.dataset.idx), found);
-  });
-  updateForm6Summary();
-  return auto;
-}
-
-function renderForm6Table() {
-  const card = document.getElementById('form6ReviewCard');
-  const tbody = document.querySelector('#form6Table tbody');
-  tbody.innerHTML = '';
-  card.style.display = form6Rows.length ? 'block' : 'none';
-
-  form6Rows.forEach((row, idx) => {
-    const d = row.draft;
-    const tr = document.createElement('tr');
-    tr.dataset.idx = idx;
-
-    const nameGuess = form6NameGuess(d);
-    const warn = d.parse_warning ? `<div class="warn2">${d.parse_warning}</div>` : '';
-
-    const wop = d.action_taken === 'WOP';
-    tr.innerHTML = `
-      <td><input type="checkbox" class="row-check" ${d.in_scope ? 'checked' : ''}></td>
-      <td class="rowno">${d.row_no || ''}</td>
-      <td class="name-cell">
-        <div class="scan-name">${nameGuess}</div>
-        <div class="scan-meta">
-          ${d.position_raw ? `<span class="mini">${d.position_raw}</span>` : ''}
-          <span class="${wop ? 'wop-text' : 'stat'}" style="font-size:0.6875rem">
-            ${d.leave_type}${wop ? ' · without pay' : ' · with pay'}</span>
-        </div>${warn}
-      </td>
-      <td class="match-cell">
-        <div class="match-done" style="display:none">
-          <div class="grow">
-            <div class="match-picked"></div>
-            <div class="match-id"></div>
-          </div>
-          <button type="button" class="match-change dense">Change</button>
-        </div>
-        <div class="match-search">
-          <div class="match-row">
-            <input class="match-input" value="${nameGuess}">
-            <button type="button" class="match-find dense">Match</button>
-          </div>
-          <div class="match-results"></div>
-        </div>
-      </td>
-      <td><input class="f-description" value="${d.description || ''}" style="min-width:160px"></td>
-      <td><input class="f-date-from" type="date" value="${d.date_from || ''}"></td>
-      <td><input class="f-date-to" type="date" value="${d.date_to || ''}"></td>
-      <td class="num">
-        <input class="f-used" type="number" step="0.5" value="${d.used || ''}"
-               style="width:68px;text-align:right">
-        ${wop ? '<div class="pill pill-warn" style="margin-top:4px">WOP</div>' : ''}
-      </td>
-      <td class="row-status"></td>
-    `;
-    tbody.appendChild(tr);
-
-    tr.querySelector('.row-check').addEventListener('change', () => {
-      syncForm6CheckAll();
-      updateForm6Summary();
-    });
-
-    setMatchState(tr, row);
-    if (!row.employeeName && row.candidates) showMatchOptions(tr, idx, row.candidates);
-
-    tr.querySelector('.match-change').addEventListener('click', () => {
-      form6Rows[idx].employeeId = null;
-      form6Rows[idx].employeeName = '';
-      setMatchState(tr, form6Rows[idx]);
-      updateForm6Summary();
-      tr.querySelector('.match-input').focus();
-    });
-
-    tr.querySelector('.match-find').addEventListener('click', async () => {
-      const q = tr.querySelector('.match-input').value.trim();
-      const resultsBox = tr.querySelector('.match-results');
-      if (q.length < 2) return;
-      resultsBox.innerHTML = '<div class="loading">' + busyText('Searching...') + '</div>';
-      try {
-        const res = await checkedFetch('/api/search?q=' + encodeURIComponent(q));
-        const data = await res.json();
-        resultsBox.innerHTML = '';
-        if (data.error) { resultsBox.innerHTML = `<div class="err">${data.error}</div>`; return; }
-        showMatchOptions(tr, idx, data.results);
-      } catch (err) {
-        if (err.message !== 'Session expired') resultsBox.innerHTML = '<div class="err">Search failed</div>';
-      }
-    });
-  });
-
-  updateForm6Summary();
 }
 
 // A settled row collapses to one line — with 70-odd rows, keeping a search
@@ -1398,27 +1198,531 @@ function setMatchState(tr, row) {
   }
 }
 
-function showMatchOptions(tr, idx, results) {
-  const resultsBox = tr.querySelector('.match-results');
-  resultsBox.innerHTML = '';
+// Employee search results, each clickable. Shared by the review rows and the
+// single-grant form.
+function renderEmployeeOptions(box, results, onPick) {
+  box.innerHTML = '';
   if (!results.length) {
-    resultsBox.innerHTML = '<div style="color:#888">No matches — edit the name and click Find</div>';
+    box.innerHTML = '<div style="color:#888">No matches — edit the name and search again</div>';
     return;
   }
   results.forEach(emp => {
     const opt = document.createElement('div');
     opt.textContent = emp.full_name + ' — ' + (emp.position || '?') + ' @ ' + (emp.school || '?');
-    opt.onclick = () => {
-      form6Rows[idx].employeeId = emp.id;
-      form6Rows[idx].employeeName = emp.full_name;
-      form6Rows[idx].autoMatched = false;
-      resultsBox.innerHTML = '';
-      setMatchState(tr, form6Rows[idx]);
-      updateForm6Summary();
-    };
-    resultsBox.appendChild(opt);
+    opt.onclick = () => { box.innerHTML = ''; onPick(emp); };
+    box.appendChild(opt);
   });
 }
+
+// The slow half of an upload: one HRIS search per distinct name. Names go up
+// in small groups so the bar moves on real progress and matched rows settle
+// into the table as they land — and a failure part-way keeps what matched.
+const MATCH_CHUNK = 4;
+
+function createReviewWorkspace(p, cfg) {
+  const $ = id => document.getElementById(p + id);
+  const state = { rows: [], filter: 'all' };
+
+  const rowEls = () => [...$('Table').querySelectorAll('tbody tr')];
+  const visibleRowEls = () => rowEls().filter(tr => tr.style.display !== 'none');
+  const draftOf = tr => state.rows[tr.dataset.idx].draft;
+  const needsAttention = tr => {
+    const row = state.rows[tr.dataset.idx];
+    return tr.querySelector('.row-check').checked && (!row.employeeId || !!row.draft.parse_warning);
+  };
+
+  // Reflect the rows in the header box: ticked when all are, indeterminate
+  // while only some are, so it never claims more than it means.
+  function syncCheckAll() {
+    const all = visibleRowEls().map(tr => tr.querySelector('.row-check'));
+    const checked = all.filter(cb => cb.checked).length;
+    const box = $('CheckAll');
+    box.checked = all.length > 0 && checked === all.length;
+    box.indeterminate = checked > 0 && checked < all.length;
+  }
+
+  // Filtering hides rows rather than re-rendering them, so every row's edits,
+  // tick state and loaded candidates survive switching between views.
+  function applyFilter() {
+    rowEls().forEach(tr => {
+      let show = true;
+      if (state.filter === 'attention') show = needsAttention(tr);
+      else if (state.filter === 'checked') show = tr.querySelector('.row-check').checked;
+      else if (cfg.extraFilter && state.filter === cfg.extraFilter.key) show = cfg.extraFilter.test(draftOf(tr));
+      tr.style.display = show ? '' : 'none';
+      tr.classList.toggle('needs-attention', needsAttention(tr));
+    });
+    $('Empty').style.display = visibleRowEls().length === 0 ? 'block' : 'none';
+    syncCheckAll();
+  }
+
+  function updateSummary() {
+    const els = rowEls();
+    const checked = els.filter(tr => tr.querySelector('.row-check').checked);
+    const counts = { all: els.length, attention: els.filter(needsAttention).length, checked: checked.length };
+    const people = new Set(els.map(tr => state.rows[tr.dataset.idx].employeeId).filter(Boolean)).size;
+    const box = $('Summary');
+    box.innerHTML = '';
+
+    const chips = [
+      ['all', 'All rows', counts.all, ''],
+      ['checked', 'Checked for submit', counts.checked, ''],
+      ['attention', 'Needs attention', counts.attention, 'chip-warn'],
+    ];
+    if (cfg.extraFilter) {
+      chips.push([cfg.extraFilter.key, cfg.extraFilter.label,
+                  els.filter(tr => cfg.extraFilter.test(draftOf(tr))).length, '']);
+    }
+    chips.forEach(([key, label, n, extra]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip ' + extra;
+      b.setAttribute('aria-pressed', state.filter === key ? 'true' : 'false');
+      b.innerHTML = `${label} <span class="n">${n}</span>`;
+      b.onclick = () => { state.filter = key; updateSummary(); };
+      box.appendChild(b);
+    });
+
+    const auto = state.rows.filter(r => r.autoMatched).length;
+    $('Kpis').style.display = els.length ? 'grid' : 'none';
+    $('KpiPeople').textContent = people;
+    $('KpiPeopleFoot').textContent = `From ${counts.all} rows`;
+    $('KpiAuto').textContent = auto;
+    $('KpiAutoFoot').textContent =
+      counts.all ? `${Math.round(auto / counts.all * 100)}% of rows resolved to one employee`
+                 : 'Resolved to one employee';
+    $('KpiAttention').textContent = counts.attention;
+    $('Kpi4').textContent = cfg.kpi4(els, checked, draftOf);
+
+    const ready = counts.checked - counts.attention;
+    $('BarTitle').textContent = counts.attention
+      ? `${ready} of ${counts.checked} checked row(s) ready — ${counts.attention} need attention`
+      : `${counts.checked} checked row(s) ready for ledger commit`;
+    const submitBtn = $('SubmitAll');
+    if (!submitBtn.disabled) {
+      submitBtn.textContent = `Submit checked rows (${counts.checked})`;
+      // At rest the bar shows how much of the batch is ready to commit; during
+      // a submission the loop below takes it over to show progress instead.
+      $('Progress').firstElementChild.style.width =
+        counts.all ? (Math.max(ready, 0) / counts.all * 100) + '%' : '0';
+    }
+    applyFilter();
+  }
+
+  function showMatchOptions(tr, idx, results) {
+    renderEmployeeOptions(tr.querySelector('.match-results'), results, emp => {
+      const row = state.rows[idx];
+      row.employeeId = emp.id;
+      row.employeeName = emp.full_name;
+      row.autoMatched = false;
+      setMatchState(tr, row);
+      updateSummary();
+    });
+  }
+
+  // Fold one chunk's results into the rows they belong to and update just
+  // those rows in place — a full re-render would throw away any edit or tick
+  // the user has already made further down the table while this runs.
+  function applyMatches(matches) {
+    let auto = 0;
+    rowEls().forEach(tr => {
+      const row = state.rows[tr.dataset.idx];
+      const found = (matches[nameGuess(row.draft)] || {}).results;
+      if (!found) return;
+      row.candidates = found;
+      if (found.length === 1) {
+        row.employeeId = found[0].id;
+        row.employeeName = found[0].full_name;
+        row.autoMatched = true;
+        auto++;
+        tr.classList.add('just-matched');
+        setTimeout(() => tr.classList.remove('just-matched'), 1300);
+      }
+      setMatchState(tr, row);
+      if (!row.employeeName) showMatchOptions(tr, Number(tr.dataset.idx), found);
+    });
+    updateSummary();
+    return auto;
+  }
+
+  async function autoMatch(status) {
+    const names = [...new Set(state.rows.map(r => nameGuess(r.draft)))];
+    const busy = busyPanel(status, `Matching ${names.length} name(s) against HRIS...`, names.length);
+    let checked = 0, auto = 0, failed = 0;
+    for (let i = 0; i < names.length; i += MATCH_CHUNK) {
+      const chunk = names.slice(i, i + MATCH_CHUNK);
+      let matches = {};
+      try {
+        const res = await checkedFetch('/api/match', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ names: chunk }),
+        });
+        const data = await res.json();
+        if (data.error) { failed += chunk.length; } else { matches = data.matches || {}; }
+      } catch (err) {
+        if (err.message === 'Session expired') { busy.done(''); return; }
+        failed += chunk.length;
+      }
+      auto += applyMatches(matches);
+      checked += chunk.length;
+      busy.step(checked, `Matching names against HRIS — ${auto} linked so far...`);
+    }
+    const left = state.rows.filter(r => r.draft.in_scope && !r.employeeId).length;
+    busy.done(
+      `Read ${state.rows.length} row(s). Matched ${auto} automatically` +
+      (left ? ` — ${left} still need a pick below.` : '. Review before submitting.') +
+      (failed ? ` (${failed} name(s) couldn't be looked up — use Match on those rows.)` : '')
+    );
+    updateSummary();
+  }
+
+  function renderTable() {
+    const tbody = $('Table').querySelector('tbody');
+    tbody.innerHTML = '';
+    $('ReviewCard').style.display = state.rows.length ? 'block' : 'none';
+
+    state.rows.forEach((row, idx) => {
+      const d = row.draft;
+      const tr = document.createElement('tr');
+      tr.dataset.idx = idx;
+      const guess = nameGuess(d);
+      const warn = d.parse_warning ? `<div class="warn2">${escapeHtml(d.parse_warning)}</div>` : '';
+      tr.innerHTML = `
+        <td><input type="checkbox" class="row-check" ${d.in_scope ? 'checked' : ''}></td>
+        <td class="rowno">${escapeHtml(d.row_no || '')}</td>
+        <td class="name-cell">
+          <div class="scan-name">${escapeHtml(guess)}</div>
+          <div class="scan-meta">
+            ${d.position_raw ? `<span class="mini">${escapeHtml(d.position_raw)}</span>` : ''}
+            ${cfg.rowLabel(d)}
+          </div>${warn}
+        </td>
+        <td class="match-cell">
+          <div class="match-done" style="display:none">
+            <div class="grow">
+              <div class="match-picked"></div>
+              <div class="match-id"></div>
+            </div>
+            <button type="button" class="match-change dense">Change</button>
+          </div>
+          <div class="match-search">
+            <div class="match-row">
+              <input class="match-input" value="${escapeHtml(guess)}">
+              <button type="button" class="match-find dense">Match</button>
+            </div>
+            <div class="match-results"></div>
+          </div>
+        </td>
+        <td><input class="f-description" value="${escapeHtml(d.description || '')}" style="min-width:160px"></td>
+        <td><input class="f-date-from" type="date" value="${d.date_from || ''}"></td>
+        <td><input class="f-date-to" type="date" value="${d.date_to || ''}"></td>
+        <td class="num">
+          <input class="f-amount" type="number" step="${cfg.amountStep}" value="${cfg.amountOf(d) || ''}"
+                 style="width:80px;text-align:right">
+          ${cfg.amountPill(d)}
+        </td>
+        <td class="row-status"></td>
+      `;
+      tbody.appendChild(tr);
+
+      tr.querySelector('.row-check').addEventListener('change', () => { syncCheckAll(); updateSummary(); });
+      setMatchState(tr, row);
+      if (!row.employeeName && row.candidates) showMatchOptions(tr, idx, row.candidates);
+
+      tr.querySelector('.match-change').addEventListener('click', () => {
+        row.employeeId = null;
+        row.employeeName = '';
+        setMatchState(tr, row);
+        updateSummary();
+        tr.querySelector('.match-input').focus();
+      });
+
+      tr.querySelector('.match-find').addEventListener('click', async () => {
+        const q = tr.querySelector('.match-input').value.trim();
+        const resultsBox = tr.querySelector('.match-results');
+        if (q.length < 2) return;
+        resultsBox.innerHTML = '<div class="loading">' + busyText('Searching...') + '</div>';
+        try {
+          const res = await checkedFetch('/api/search?q=' + encodeURIComponent(q));
+          const data = await res.json();
+          resultsBox.innerHTML = '';
+          if (data.error) { resultsBox.innerHTML = `<div class="err">${escapeHtml(data.error)}</div>`; return; }
+          showMatchOptions(tr, idx, data.results);
+        } catch (err) {
+          if (err.message !== 'Session expired') resultsBox.innerHTML = '<div class="err">Search failed</div>';
+        }
+      });
+    });
+    updateSummary();
+  }
+
+  $('Upload').addEventListener('click', async () => {
+    const fileInput = $('File');
+    const status = $('Status');
+    const uploadBtn = $('Upload');
+    if (!fileInput.files.length) { status.textContent = 'Choose a file first.'; return; }
+    const busy = busyPanel(status, 'Reading the scan — dewarping the page and OCR-ing each cell...');
+    uploadBtn.disabled = true;
+    const fd = new FormData();
+    fd.append('file', fileInput.files[0]);
+    try {
+      const res = await checkedFetch('/api/ocr?expect=' + cfg.expect, { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.error) { showNotes($('Notes'), []); busy.done('Error: ' + data.error); return; }
+      state.rows = data.rows.map(r => ({ draft: r, employeeId: null, employeeName: '' }));
+      showNotes($('Notes'), data.notes || []);
+      busy.done('');
+      renderTable();
+      await autoMatch(status);
+    } catch (err) {
+      busy.done(err.message === 'Session expired' ? '' : 'Upload failed: ' + err);
+    } finally {
+      uploadBtn.disabled = false;
+    }
+  });
+
+  $('CheckAll').addEventListener('change', (e) => {
+    // Only what the user can currently see, so a tick never changes a row
+    // hidden behind a filter.
+    visibleRowEls().forEach(tr => { tr.querySelector('.row-check').checked = e.target.checked; });
+    syncCheckAll();
+    updateSummary();
+  });
+
+  $('SubmitAll').addEventListener('click', async () => {
+    const toSubmit = rowEls().filter(tr => tr.querySelector('.row-check').checked);
+    if (!toSubmit.length) {
+      alertModal('No rows checked', 'Tick the rows you want written to HRIS first.');
+      return;
+    }
+    const missingMatch = toSubmit.filter(tr => state.rows[tr.dataset.idx].employeeId === null);
+    if (missingMatch.length) {
+      await alertModal(
+        `${missingMatch.length} row(s) have no employee yet`,
+        'Click "Match" on each of those rows and pick the matching employee before submitting.'
+      );
+      return;
+    }
+    if (SUBMIT_ENABLED) {
+      const people = new Set(toSubmit.map(tr => state.rows[tr.dataset.idx].employeeId)).size;
+      const ok = await confirmModal({
+        title: `Write ${toSubmit.length} record(s) to HRIS?`,
+        rows: [['Rows', `${toSubmit.length} across ${people} employee(s)`], ...cfg.confirmRows(toSubmit, draftOf)],
+        note: 'These are real records, written one at a time. It cannot be undone from this tool.',
+        confirmText: `Write ${toSubmit.length} record(s)`,
+      });
+      if (!ok) return;
+    }
+
+    const submitBtn = $('SubmitAll');
+    const progress = $('Progress');
+    const bar = progress.firstElementChild;
+    const submitStatus = $('SubmitStatus');
+    setBtnBusy(submitBtn, `Submitting 1 of ${toSubmit.length}...`);
+    progress.classList.remove('indeterminate');
+    let done = 0, failed = 0;
+
+    for (const tr of toSubmit) {
+      const row = state.rows[tr.dataset.idx];
+      submitStatus.innerHTML = busyText(`Submitting ${done + 1} of ${toSubmit.length}...`);
+      setBtnBusy(submitBtn, `Submitting ${done + 1} of ${toSubmit.length}...`);
+      // Keep the row being written in view, so a long batch stays followable.
+      tr.scrollIntoView({ block: 'nearest' });
+      const statusCell = tr.querySelector('.row-status');
+      statusCell.innerHTML = busyText('Submitting...');
+      statusCell.className = 'row-status';
+      const body = {
+        employee_id: row.employeeId,
+        description: tr.querySelector('.f-description').value,
+        date_from: tr.querySelector('.f-date-from').value,
+        date_to: tr.querySelector('.f-date-to').value,
+        ...cfg.amountFields(row.draft, tr.querySelector('.f-amount').value),
+      };
+      try {
+        const res = await checkedFetch('/api/add', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (data.error) {
+          statusCell.textContent = 'Failed: ' + data.error;
+          statusCell.className = 'row-status err';
+          failed++;
+        } else {
+          statusCell.textContent = data.dry_run ? 'Previewed (dry run)' : '✓ Submitted';
+          statusCell.className = 'row-status ok';
+          tr.classList.add('row-done');
+          tr.querySelector('.row-check').checked = false;
+        }
+      } catch (err) {
+        statusCell.textContent = err.message === 'Session expired' ? 'Session expired' : 'Failed: ' + err;
+        statusCell.className = 'row-status err';
+        failed++;
+      }
+      done++;
+      bar.style.width = (done / toSubmit.length * 100) + '%';
+    }
+
+    clearBtnBusy(submitBtn, 'Submit checked rows');
+    // Submitted rows untick themselves, so what is left checked is exactly
+    // what still needs another go.
+    submitStatus.textContent = failed
+      ? `${done - failed} submitted, ${failed} failed — the failures are still checked.`
+      : `All ${done} submitted.`;
+    syncCheckAll();
+    updateSummary();
+  });
+
+  // Exposed for tests and for the WOP audit, which reads the leave rows.
+  state.renderTable = renderTable;
+  state.updateSummary = updateSummary;
+  return state;
+}
+
+const sumAmounts = els => els.reduce((sum, tr) => sum + (parseFloat(tr.querySelector('.f-amount').value) || 0), 0);
+
+// Leave: every row deducts — paid leave from "used", leave without pay into
+// "wo_pay".
+const leaveReview = createReviewWorkspace('form6', {
+  expect: 'leave',
+  rowLabel: d => {
+    const wop = d.action_taken === 'WOP';
+    return `<span class="${wop ? 'wop-text' : 'stat'}" style="font-size:0.6875rem">` +
+           `${escapeHtml(d.leave_type)}${wop ? ' · without pay' : ' · with pay'}</span>`;
+  },
+  amountStep: '0.5',
+  amountOf: d => d.used,
+  amountPill: d => d.action_taken === 'WOP' ? '<div class="pill pill-warn" style="margin-top:4px">WOP</div>' : '',
+  amountFields: (d, value) => ({ used: value, without_pay: d.action_taken === 'WOP' }),
+  extraFilter: { key: 'wop', label: 'Without pay (WOP)', test: d => d.action_taken === 'WOP' },
+  kpi4: (els, checked, draftOf) => els.filter(tr => draftOf(tr).action_taken === 'WOP').length,
+  confirmRows: (toSubmit, draftOf) => {
+    const wop = toSubmit.filter(tr => draftOf(tr).action_taken === 'WOP').length;
+    return [['Under "used"', `${toSubmit.length - wop} row(s)`], ['Under "without pay"', `${wop} row(s)`]];
+  },
+});
+
+// Service credits: every row adds, into "earned".
+const vscReview = createReviewWorkspace('vsc', {
+  expect: 'vsc',
+  rowLabel: d => `<span class="stat" style="font-size:0.6875rem">Vacation service credits` +
+                 `${d.hours != null ? ` · ${d.hours} hrs` : ''}</span>`,
+  amountStep: 'any',
+  amountOf: d => d.earned,
+  amountPill: () => '<div class="pill pill-ok" style="margin-top:4px">+ Earned</div>',
+  amountFields: (d, value) => ({ earned: value }),
+  extraFilter: null,
+  kpi4: (els, checked) => fmtDays(sumAmounts(checked)),
+  confirmRows: toSubmit => [['Added to "earned"', `${fmtDays(sumAmounts(toSubmit))} day(s) in total`]],
+});
+
+// ----- Single grant, by hand -----
+
+let vscEmployee = null;
+let vscDescriptionTouched = false;
+
+document.getElementById('vscEmpFind').addEventListener('click', async () => {
+  const q = document.getElementById('vscEmpQ').value.trim();
+  const box = document.getElementById('vscEmpResults');
+  if (q.length < 2) return;
+  box.innerHTML = '<div class="loading">' + busyText('Searching...') + '</div>';
+  try {
+    const res = await checkedFetch('/api/search?q=' + encodeURIComponent(q));
+    const data = await res.json();
+    if (data.error) { box.innerHTML = `<div class="err">${escapeHtml(data.error)}</div>`; return; }
+    renderEmployeeOptions(box, data.results, emp => {
+      vscEmployee = emp;
+      document.getElementById('vscEmpQ').value = emp.full_name;
+      document.getElementById('vscEmpChosen').textContent = `Selected: ${emp.full_name} — HRIS ID #${emp.id}`;
+    });
+  } catch (err) {
+    if (err.message !== 'Session expired') box.innerHTML = '<div class="err">Search failed</div>';
+  }
+});
+
+// VSC days = hours x factor / 8, to the 3 decimals the ledger keeps. The
+// figure stays editable: the order may have granted something else.
+function recomputeVsc() {
+  const hours = parseFloat(document.getElementById('vscHours').value);
+  const factor = parseFloat(document.getElementById('vscFactor').value);
+  if (!isNaN(hours) && !isNaN(factor)) {
+    const days = Math.round(hours * factor / 8 * 1000) / 1000;
+    document.getElementById('vscEarned').value = days;
+    document.getElementById('vscFormula').textContent =
+      `${hours} hrs × ${factor} ÷ 8 = ${days} day(s) — edit it to match the order.`;
+  }
+  suggestVscDescription();
+}
+
+function suggestVscDescription() {
+  if (vscDescriptionTouched) return;
+  const from = document.getElementById('vscFrom').value;
+  const to = document.getElementById('vscTo').value;
+  const hours = document.getElementById('vscHours').value;
+  if (!from) return;
+  const fmt = iso => new Date(iso + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+  const period = !to || to === from ? `${fmt(from)}, ${from.slice(0, 4)}` : `${fmt(from)} - ${fmt(to)}, ${to.slice(0, 4)}`;
+  document.getElementById('vscDescription').value =
+    `Vacation service credits ${period}` + (hours ? ` (${hours} hrs)` : '');
+}
+
+['vscHours', 'vscFactor'].forEach(id => document.getElementById(id).addEventListener('input', recomputeVsc));
+['vscFrom', 'vscTo'].forEach(id => document.getElementById(id).addEventListener('change', suggestVscDescription));
+document.getElementById('vscDescription').addEventListener('input', () => { vscDescriptionTouched = true; });
+
+document.getElementById('vscAddBtn').addEventListener('click', async () => {
+  const result = document.getElementById('vscAddResult');
+  const body = {
+    employee_id: vscEmployee && vscEmployee.id,
+    earned: document.getElementById('vscEarned').value,
+    date_from: document.getElementById('vscFrom').value,
+    date_to: document.getElementById('vscTo').value,
+    description: document.getElementById('vscDescription').value,
+  };
+  if (!vscEmployee) { showError(result, 'Find and select the employee first.'); return; }
+  const earned = parseFloat(body.earned);
+  if (isNaN(earned) || earned <= 0) { showError(result, 'Credits earned must be a positive number.'); return; }
+  if (!body.date_from || !body.date_to) { showError(result, 'Both start and end dates are required.'); return; }
+  if (body.date_to < body.date_from) { showError(result, 'End date cannot be before start date.'); return; }
+  if (!body.description.trim()) { showError(result, 'Description is required.'); return; }
+
+  if (SUBMIT_ENABLED) {
+    const ok = await confirmModal({
+      title: 'Add these credits to HRIS?',
+      rows: [
+        ['Employee', vscEmployee.full_name],
+        ['Description', body.description],
+        ['Dates', body.date_from + ' to ' + body.date_to],
+        ['Added to "earned"', earned + ' day(s)'],
+      ],
+      note: 'This writes a real Service Credit record. It cannot be undone from this tool.',
+      confirmText: 'Add credits',
+    });
+    if (!ok) return;
+  }
+  const btn = document.getElementById('vscAddBtn');
+  setBtnBusy(btn, 'Submitting...');
+  result.innerHTML = '';
+  try {
+    const res = await checkedFetch('/api/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.error) showError(result, escapeHtml(data.error));
+    else if (data.dry_run) {
+      result.innerHTML = '<div class="ok-box">Preview (dry run) — nothing was sent to HRIS.</div>' +
+        '<pre style="margin-top:8px">' + escapeHtml(JSON.stringify(data.result, null, 2)) + '</pre>';
+    } else showSuccess(result, '✓ Credits added.');
+  } catch (err) {
+    if (err.message !== 'Session expired') showError(result, 'Submission failed — check your connection and try again.');
+  } finally {
+    clearBtnBusy(btn);
+  }
+});
 
 // Find already-submitted without-pay rows whose days landed in "used".
 // Read-only: it lists what it finds and repairs nothing on its own.
@@ -1426,7 +1730,7 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
   const status = document.getElementById('wopStatus');
   const table = document.getElementById('wopWrap');
   const tbody = table.querySelector('tbody');
-  const rows = form6Rows
+  const rows = leaveReview.rows
     .filter(r => r.draft.action_taken === 'WOP' && r.employeeId)
     .map(r => ({
       employee_id: r.employeeId,
@@ -1437,7 +1741,7 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
 
   const auditBtn = document.getElementById('wopAudit');
   setBtnBusy(auditBtn, 'Checking...');
-  const busy = form6Busy(status, `Checking ${rows.length} row(s) against each ledger...`);
+  const busy = busyPanel(status, `Checking ${rows.length} row(s) against each ledger...`);
   tbody.innerHTML = '';
   let records;
   try {
@@ -1516,99 +1820,6 @@ document.getElementById('wopAudit').addEventListener('click', async () => {
   });
 });
 
-document.getElementById('form6SubmitAll').addEventListener('click', async () => {
-  const rowsEl = [...document.querySelectorAll('#form6Table tbody tr')];
-  const toSubmit = rowsEl.filter(tr => tr.querySelector('.row-check').checked);
-  if (!toSubmit.length) {
-    alertModal('No rows checked', 'Tick the rows you want written to HRIS first.');
-    return;
-  }
-
-  const missingMatch = toSubmit.filter(tr => form6Rows[tr.dataset.idx].employeeId === null);
-  if (missingMatch.length) {
-    await alertModal(
-      `${missingMatch.length} row(s) have no employee yet`,
-      'Click "Find" on each of those rows and pick the matching employee before submitting.'
-    );
-    return;
-  }
-
-  if (SUBMIT_ENABLED) {
-    const wop = toSubmit.filter(tr => form6Rows[tr.dataset.idx].draft.action_taken === 'WOP').length;
-    const people = new Set(toSubmit.map(tr => form6Rows[tr.dataset.idx].employeeId)).size;
-    const ok = await confirmModal({
-      title: `Write ${toSubmit.length} record(s) to HRIS?`,
-      rows: [
-        ['Rows', `${toSubmit.length} across ${people} employee(s)`],
-        ['Under "used"', `${toSubmit.length - wop} row(s)`],
-        ['Under "without pay"', `${wop} row(s)`],
-      ],
-      note: 'These are real records, written one at a time. It cannot be undone from this tool.',
-      confirmText: `Write ${toSubmit.length} record(s)`,
-    });
-    if (!ok) return;
-  }
-
-  const submitBtn = document.getElementById('form6SubmitAll');
-  const progress = document.getElementById('form6Progress');
-  const bar = progress.firstElementChild;
-  const submitStatus = document.getElementById('form6SubmitStatus');
-  setBtnBusy(submitBtn, `Submitting 1 of ${toSubmit.length}...`);
-  progress.classList.remove('indeterminate');
-  let done = 0, failed = 0;
-
-  for (const tr of toSubmit) {
-    const idx = tr.dataset.idx;
-    submitStatus.innerHTML = busyText(`Submitting ${done + 1} of ${toSubmit.length}...`);
-    setBtnBusy(submitBtn, `Submitting ${done + 1} of ${toSubmit.length}...`);
-    // Keep the row being written in view, so a long batch stays followable.
-    tr.scrollIntoView({ block: 'nearest' });
-    const statusCell = tr.querySelector('.row-status');
-    statusCell.innerHTML = busyText('Submitting...');
-    statusCell.className = 'row-status';
-    const body = {
-      employee_id: form6Rows[idx].employeeId,
-      description: tr.querySelector('.f-description').value,
-      date_from: tr.querySelector('.f-date-from').value,
-      date_to: tr.querySelector('.f-date-to').value,
-      used: tr.querySelector('.f-used').value,
-      without_pay: form6Rows[idx].draft.action_taken === 'WOP',
-    };
-    try {
-      const res = await checkedFetch('/api/add', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body)
-      });
-      const data = await res.json();
-      if (data.error) {
-        statusCell.textContent = 'Failed: ' + data.error;
-        statusCell.className = 'row-status err';
-        failed++;
-      } else {
-        statusCell.textContent = data.dry_run ? 'Previewed (dry run)' : '✓ Submitted';
-        statusCell.className = 'row-status ok';
-        tr.classList.add('row-done');
-        tr.querySelector('.row-check').checked = false;
-      }
-    } catch (err) {
-      statusCell.textContent = err.message === 'Session expired' ? 'Session expired' : 'Failed: ' + err;
-      statusCell.className = 'row-status err';
-      failed++;
-    }
-    done++;
-    bar.style.width = (done / toSubmit.length * 100) + '%';
-  }
-
-  clearBtnBusy(submitBtn, 'Submit checked rows');
-  // Submitted rows untick themselves, so what is left checked is exactly
-  // what still needs another go.
-  submitStatus.textContent = failed
-    ? `${done - failed} submitted, ${failed} failed — the failures are still checked.`
-    : `All ${done} submitted.`;
-  syncForm6CheckAll();
-  updateForm6Summary();
-});
 </script>
 {% endif %}
 </body>
@@ -1758,17 +1969,23 @@ def api_add():
         return jsonify({"error": "Both start and end dates are required."}), 400
     if date_to < date_from:
         return jsonify({"error": "End date cannot be before start date."}), 400
+    # A record either adds credit (a service credit grant, "earned") or
+    # deducts it (leave, "used" / "wo_pay") — never both. The two directions
+    # arrive as different fields so a grant can't be misread as a deduction.
     try:
         days = float(body.get("used") or 0)
+        earned = float(body.get("earned") or 0)
     except (ValueError, TypeError):
-        return jsonify({"error": "Used must be a number."}), 400
-    if days <= 0:
-        return jsonify({"error": "Used must be a positive number."}), 400
+        return jsonify({"error": "Days must be a number."}), 400
+    if days > 0 and earned > 0:
+        return jsonify({"error": "A record can't both add and deduct credit — send one or the other."}), 400
+    if days <= 0 and earned <= 0:
+        return jsonify({"error": "Enter a positive number of days to deduct or credits earned."}), 400
 
     # Leave taken without pay consumes no leave credit, so HRIS keeps it in
     # its own "wo_pay" column. Putting those days in "used" would deduct them
     # from the employee's balance as if they had been paid leave.
-    without_pay = bool(body.get("without_pay"))
+    without_pay = bool(body.get("without_pay")) and earned <= 0
 
     try:
         result = client.create_leave_credit(
@@ -1777,8 +1994,11 @@ def api_add():
             description=description,
             date_from=date_from or None,
             date_to=date_to or None,
-            used=0 if without_pay else days,
+            used=0 if (without_pay or earned > 0) else days,
             wo_pay=days if without_pay else 0,
+            # The ledger keeps three decimals ("25.944"); a float carried
+            # through JSON can arrive as 25.943999999.
+            earned=round(earned, 3),
             dry_run=not SUBMIT_ENABLED,
         )
     except HrisError as e:
@@ -1916,7 +2136,7 @@ def api_ocr():
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             file.save(tmp.name)
             tmp_path = tmp.name
-        rows = extract_form6(tmp_path)
+        rows, notes = extract_form6_with_notes(tmp_path)
     except Exception as e:  # noqa: BLE001 - surface any OCR failure to the UI, not a 500 traceback
         return jsonify({"error": f"Couldn't read this file: {e}"}), 422
     finally:
@@ -1926,8 +2146,31 @@ def api_ocr():
             except OSError:
                 pass
 
+    # Each tab takes one kind of document: leave transmittals deduct, service
+    # credit grants add. A document of the other kind is sent back with where
+    # it belongs, rather than its rows landing in a review table built for the
+    # opposite direction.
+    expect = request.args.get("expect")
+    if expect in ("leave", "vsc"):
+        wanted = [r for r in rows if r.kind == expect]
+        if rows and not wanted:
+            if expect == "leave":
+                where = "a vacation service credit grant — upload it on the Service Credits Earned tab"
+            else:
+                where = "a leave transmittal (Form 6) — upload it on the Form 6 tab"
+            return jsonify({"error": f"This looks like {where}."}), 422
+        if len(wanted) < len(rows):
+            notes = notes + [
+                f"{len(rows) - len(wanted)} row(s) of the other kind of document were left out "
+                "of this tab — upload those pages on the other tab."
+            ]
+        rows = wanted
+
     return jsonify(
         {
+            # What couldn't be read — a page whose rows are missing entirely
+            # isn't visible from the rows themselves.
+            "notes": notes,
             "rows": [
                 {
                     "row_no": r.row_no,
@@ -1943,6 +2186,9 @@ def api_ocr():
                     "used": r.used,
                     "parse_warning": r.parse_warning,
                     "in_scope": r.in_scope,
+                    "kind": r.kind,
+                    "earned": r.earned,
+                    "hours": r.hours,
                 }
                 for r in rows
             ]
