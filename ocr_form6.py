@@ -102,6 +102,9 @@ class Form6Row:
     kind: str = "leave"
     hours: float | None = None
     earned: str = ""
+    # What a grant was earned for, as its paragraph names it ("Aral Summer
+    # Program"). Empty when the page doesn't say.
+    event: str = ""
 
     @property
     def full_name_search(self) -> str:
@@ -137,6 +140,24 @@ def _order_corners(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray,
     tr = pts[np.argmin(diff)]
     bl = pts[np.argmax(diff)]
     return tl, tr, br, bl
+
+
+def _count_table_regions(img: np.ndarray) -> int:
+    """How many separate tables of comparable size the page holds.
+
+    _dewarp_table reads only the largest, which is right for a scan: the
+    runner-up region on every sample so far is a stamp or a stray rule, under
+    3% of the table's size. A photo of sheets fanned over one another
+    (Lapasan's three-page Annex D) has one table per sheet at nearly equal
+    sizes, and reading only one of them drops the others' teachers without
+    a word."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    contours, _ = cv2.findContours(_grid_mask(_binary_threshold(gray)), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    areas = sorted((cv2.contourArea(c) for c in contours), reverse=True)
+    if not areas:
+        return 0
+    page = img.shape[0] * img.shape[1]
+    return sum(1 for a in areas if a >= 0.4 * areas[0] and a >= 0.01 * page)
 
 
 def _dewarp_table(img: np.ndarray) -> np.ndarray:
@@ -1065,12 +1086,15 @@ def _build_description(leave_type: str, date_from: str | None, date_to: str | No
     return f"{label} {MONTH_NAMES[df.month]} {df.day} - {MONTH_NAMES[dt.month]} {dt.day}, {dt.year}"
 
 
-def _detect_default_year(img: np.ndarray) -> int | None:
+def _page_text(img: np.ndarray) -> str:
+    """The whole page OCR'd once (not the dewarped table): the header and
+    paragraph around the table say things its cells don't."""
+    return pytesseract.image_to_string(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+
+def _detect_default_year(text: str) -> int | None:
     """Some templates (e.g. Lumbia) never print a year in the dates column
-    itself, only once in the page header ("For the Month of June 2026").
-    OCR the raw page (not the dewarped table) once to recover it."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(gray)
+    itself, only once in the page header ("For the Month of June 2026")."""
     m = re.search(r"month\s+of\s+\w+\s+(\d{4})", text, re.IGNORECASE)
     if m:
         return int(m.group(1))
@@ -1278,6 +1302,72 @@ HOURS_PER_DAY = 8
 _NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
 
+# Where the event's name ends: "on"/"from" followed by a date ("on JUNE 12-13",
+# "from May 6") or "held" ("HELD AT FR. WILLIAM F. MASTERSON ..."). A bare "on"
+# isn't enough: "Orientation on the Strengthened SHS" is part of the name. The
+# date's month isn't matched by name, since OCR misspells it ("Janauary").
+_EVENT_END_RE = re.compile(r"\s+(?:(?:on|from)\s+[A-Za-z]{3,}\.?\s*\d|held\b)", re.IGNORECASE)
+# "during", including OCR'd remnants of it: Pedro Roa's came back "duri : 3 uring".
+_EVENT_START_RE = re.compile(r"\b(?:d?uring)\s+", re.IGNORECASE)
+_EVENT_FILLER_RE = re.compile(r"^(?:(?:the|participation\s+in|conduct\s+of)\s+)+", re.IGNORECASE)
+_EVENT_SMALL_WORDS = {"A", "AN", "AND", "AT", "BY", "CUM", "FOR", "IN", "OF", "ON", "OR", "THE", "TO", "WITH"}
+
+
+def _event_from_text(text: str) -> str:
+    """The event a grant was earned for, from the order's paragraph: "...
+    for services rendered during DIVISION TRAINING FOR THE STRENGTHENED
+    SENIOR HIGH SCHOOL CURRICULUM on JUNE 12-13, 2026". Empty when the page
+    has no such sentence (a continuation page) or it didn't OCR cleanly."""
+    flat = " ".join(re.sub(r"-\s*\n\s*", "", text).split())   # rejoin "ser-\nvice"
+    anchor = re.search(r"rendered|service\s+credits?", flat, re.IGNORECASE)
+    if not anchor:
+        return ""
+    tail = flat[anchor.end():anchor.end() + 400]
+    end = _EVENT_END_RE.search(tail)
+    if not end:
+        return ""
+    starts = list(_EVENT_START_RE.finditer(tail, 0, end.start()))
+    if not starts:
+        return ""
+    event = _EVENT_FILLER_RE.sub("", tail[starts[-1].end():end.start()]).strip(" .,;:")
+    if not 3 <= len(event) <= 200:
+        return ""
+    return _event_case(event)
+
+
+def _event_case(event: str) -> str:
+    """Readable casing for an event printed in capitals; mixed case is kept
+    as printed. Short words with no vowel are acronyms (SHS, SY, NHS) and
+    stay capitals — "OLD" and "DAY" don't — as does anything in parentheses
+    or with digits or dots ("(SRP)", "S.J.")."""
+    letters = [c for c in event if c.isalpha()]
+    if not letters or sum(c.isupper() for c in letters) < 0.8 * len(letters):
+        return event
+    words = []
+    for i, word in enumerate(event.split()):
+        core = word.strip("(),")
+        if not core.isalpha():
+            words.append(word)
+        elif core in _EVENT_SMALL_WORDS and i > 0:
+            words.append(word.lower())
+        elif len(core) <= 4 and not re.search("[AEIOU]", core) or word.startswith("("):
+            words.append(word)
+        else:
+            words.append(word.replace(core, core.capitalize()))
+    return " ".join(words)
+
+
+def _vsc_description(event: str, date_from: str | None, date_to: str | None, hours: float | None) -> str:
+    """"Vacation service credits, Aral Summer Program, May 6-31, 2026 (113.29 hrs)"."""
+    parts = ["Vacation service credits"]
+    if event:
+        parts.append(event)
+    if date_from:
+        parts.append(_format_period(date_from, date_to))
+    description = ", ".join(parts) if event else " ".join(parts)
+    return description + (f" ({hours:g} hrs)" if hours is not None else "")
+
+
 def _split_name_first_last(raw: str) -> tuple[str, str, str]:
     """Split a "First M. Last" name — the order a grant form prints it in.
 
@@ -1338,8 +1428,12 @@ def _normalize_hours(raw: str) -> float | None:
         if h is None or mi is None:
             return None
         return round(h + mi / 60, 3)
-    m = re.search(r"\d+(?:\.\d+)?", _normalize_digits(s))
-    return float(m.group(0)) if m else None
+    # Not _normalize_digits: it joins every digit run, so "72.52" became 7252
+    # hours — and a figure that large lifts the credit ceiling instead of
+    # tripping it. Look-alikes are folded to 1 in place, keeping the point.
+    folded = re.sub("[" + re.escape("".join(_ONE_LOOKALIKES)) + "]", "1", s.strip())
+    m = re.search(r"\d+(?:[.,]\d+)?", folded)
+    return float(m.group(0).replace(",", ".")) if m else None
 
 
 def _normalize_credits(raw: str) -> float | None:
@@ -1480,8 +1574,10 @@ def _period_from_dates(raw: str, default_year: int | None) -> tuple[str | None, 
 
 def _extract_vsc_row(
     img: np.ndarray, cells: dict[str, list[tuple[str, tuple[int, int, int, int]]]],
-    default_year: int | None, seq: int, previous_dates: str | None = None,
+    default_year: int | None, seq: int, previous: Form6Row | None = None, event: str = "",
 ) -> list[Form6Row]:
+    """previous: the grant row above, for "-do-" cells to inherit from.
+    event: what the page's paragraph says the grants were earned for."""
     def read_all(field: str, psm: int, whitelist: str | None) -> str:
         # A pen tick or margin line through a column can split one cell into
         # two boxes; reading them left to right keeps the whole value.
@@ -1493,25 +1589,41 @@ def _extract_vsc_row(
     if not last_name or not first_name:
         return []
 
+    ditto_notes = []
     # psm 6: "31 HOURS & 37 MINUTES" wraps over three lines in its cell.
-    hours = _normalize_hours(read_all("hours", 6, None))
+    hours_raw = read_all("hours", 6, None)
+    if _DITTO_RE.match(hours_raw):
+        hours = previous.hours if previous else None
+        if hours is None:
+            ditto_notes.append("Hours are \"-do-\" but the row above had none to repeat — enter them from the paper.")
+    else:
+        hours = _normalize_hours(hours_raw)
     credit_boxes = [box for _, box in cells.get("credits") or []]
     credit_wl = "0123456789.,"
-    printed, credits_warning = _consensus_credits([
-        " ".join(_ocr_cell(img, b, 7, credit_wl) for b in credit_boxes),
-        " ".join(_ocr_cell(img, b, 6, credit_wl) for b in credit_boxes),
-        " ".join(_ocr_cell_plain(img, b, 7, credit_wl) for b in credit_boxes),
-    ], vsc_ceiling(hours))
-    if hours is None and printed is None and not credits_warning:
+    # Read once without the digits whitelist first: under it "-do-" comes
+    # back as "0", which would be filled in as zero credits.
+    if credit_boxes and _DITTO_RE.match(read_all("credits", 7, None)):
+        printed, credits_warning = None, None
+        if previous and previous.earned:
+            printed = float(previous.earned)
+        else:
+            ditto_notes.append("Credits are \"-do-\" but the row above had none to repeat — enter them from the paper.")
+    else:
+        printed, credits_warning = _consensus_credits([
+            " ".join(_ocr_cell(img, b, 7, credit_wl) for b in credit_boxes),
+            " ".join(_ocr_cell(img, b, 6, credit_wl) for b in credit_boxes),
+            " ".join(_ocr_cell_plain(img, b, 7, credit_wl) for b in credit_boxes),
+        ], vsc_ceiling(hours))
+    if hours is None and printed is None and not credits_warning and not ditto_notes:
         # No figures at all: a header remnant or a note row, not a grant.
         return []
 
     # The same two-pass read as a leave row's dates: a whitelist without "/"
     # would turn "02/07/2026" into "02072026".
     dates_raw = _ocr_date_cell(img, cells["dates"][0][1])[0] if cells.get("dates") else ""
-    if previous_dates and _DITTO_RE.match(dates_raw):
+    if previous and previous.dates_raw and _DITTO_RE.match(dates_raw):
         # Carried down as the text itself, so a run of "DO"s chains.
-        dates_raw = previous_dates
+        dates_raw = previous.dates_raw
     date_from, date_to, date_warning = _period_from_dates(dates_raw, default_year)
     period_days = (
         (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1 if date_from else None
@@ -1524,10 +1636,7 @@ def _extract_vsc_row(
     if not row_no.isdigit():
         row_no = str(seq)
 
-    period = _format_period(date_from, date_to) if date_from else ""
-    description = "Vacation service credits" + (f" {period}" if period else "")
-    if hours is not None:
-        description += f" ({hours:g} hrs)"
+    description = _vsc_description(event, date_from, date_to, hours)
 
     return [Form6Row(
         row_no=row_no,
@@ -1544,7 +1653,7 @@ def _extract_vsc_row(
         date_to=date_to,
         description=description,
         used="",
-        parse_warning=" ".join(w for w in (date_warning, warning) if w) or None,
+        parse_warning=" ".join(w for w in (date_warning, *ditto_notes, warning) if w) or None,
         # Ticked for submission only when something corroborates the figure:
         # the hours it was checked against, or at least a period that bounded
         # it. A lone number read off a scan with neither isn't pre-ticked.
@@ -1552,13 +1661,14 @@ def _extract_vsc_row(
         kind="vsc",
         hours=hours,
         earned=_format_used(earned) if earned is not None else "",
+        event=event,
     )]
 
 
 def _extract_mapped_row(
     img: np.ndarray, row_boxes: list[tuple[int, int, int, int]],
     labels: list[str | None], default_year: int | None, seq: int,
-    previous_dates: str | None = None,
+    previous: Form6Row | None = None, event: str = "",
 ) -> list[Form6Row]:
     """Read one data row using the header's own column labels, whatever order
     the school chose to print them in."""
@@ -1568,7 +1678,7 @@ def _extract_mapped_row(
             cells.setdefault(label, []).append(("", box))
 
     if cells.get("hours") or cells.get("credits"):
-        return _extract_vsc_row(img, cells, default_year, seq, previous_dates)
+        return _extract_vsc_row(img, cells, default_year, seq, previous, event)
 
     def read(field: str, psm: int, whitelist: str | None, index: int = 0) -> str:
         entries = cells.get(field) or []
@@ -1906,6 +2016,38 @@ def _load_pages(path: str) -> list[np.ndarray]:
     return [img]
 
 
+# Clockwise degrees, as Tesseract's orientation detection reports them.
+_ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+# Below this Tesseract is guessing. Bulua's upright Form 6 pages read as upside
+# down at 2.8-3.5; the sideways orders photographed so far all score above 13.
+_MIN_ORIENTATION_CONFIDENCE = 5.0
+
+
+def _upright(img: np.ndarray) -> np.ndarray:
+    """Turn a page photographed sideways or upside down the right way up.
+
+    A phone held in portrait over a landscape-printed order gives a sideways
+    table, whose rows then read as columns ("13-column (6 rows)"), so every
+    Kauswagan, Macabalan and Taglimao order shot that way was refused.
+
+    Uses Tesseract's orientation detection (the osd language pack, which the
+    Windows installer includes). If that isn't installed, or isn't sure, the
+    page is left as it is: the reader behaves exactly as it did before."""
+    h, w = img.shape[:2]
+    scale = min(1.0, 1600 / max(h, w))
+    small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else img
+    try:
+        osd = _run_tesseract(small, 0, None)
+    except ValueError:
+        return img
+    rotate = re.search(r"Rotate:\s*(\d+)", osd)
+    confidence = re.search(r"Orientation confidence:\s*([\d.]+)", osd)
+    if not rotate or not confidence or float(confidence.group(1)) < _MIN_ORIENTATION_CONFIDENCE:
+        return img
+    code = _ROTATIONS.get(int(rotate.group(1)))
+    return cv2.rotate(img, code) if code is not None else img
+
+
 def _resolve_leave_type(type_raw: str | None, raw_action: str) -> tuple[str, str]:
     """(leave type, action) for one row. `type_raw` is None when the form has
     no Type of Leave column at all.
@@ -1989,22 +2131,44 @@ def _ink_profile(img: np.ndarray, box: Box, pad: int = 6) -> np.ndarray | None:
     return (ink > 0).sum(axis=0) >= 2
 
 
+def _has_text(img: np.ndarray, box: Box, min_percent: float = 1.0, pad: int = 6) -> bool:
+    """Whether a cell holds writing, not just paper grain or a stray rule.
+
+    Tesseract finds letters in noise: the empty pre-printed rows of a grainy
+    Macabalan photo came back as "Nnn, Nnn Eee An". Dark pixels are counted
+    against the cell's own paper tone, after removing long straight strokes —
+    the table's rules, which a crooked row can drag into its cells."""
+    x, y, w, h = box
+    crop = img[y + pad : y + h - pad, x + pad : x + w - pad]
+    if crop.size == 0:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    dark = (gray < np.median(gray) - 60).astype(np.uint8)
+    ch, cw = dark.shape
+    lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, cw // 3), 1)))
+    lines |= cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(ch * 0.8)))))
+    return float((dark & (1 - lines)).mean()) * 100 >= min_percent
+
+
 def _find_ruleless_split(img: np.ndarray, cells: list[Box]) -> int | None:
     """Where one detected column is really two with no rule printed between
-    them — the x of a gap that is blank in (nearly) every row and has text on
-    both sides of it in most rows. None if there's no such gap."""
+    them — the x of a gap that is blank in most rows and has text on both
+    sides of it in at least half. None if there's no such gap.
+
+    "Most", not "every": a signature or sticker crossing the table's last row
+    (Kauswagan's one-teacher orders) puts ink in the gap of that row alone."""
     profiles = [(b[0] + 6, p) for b in cells if (p := _ink_profile(img, b)) is not None]
-    if len(profiles) < 2:
+    if not profiles:
         return None
     left = min(x for x, _ in profiles)
     right = max(x + len(p) for x, p in profiles)
     counts = np.zeros(right - left, dtype=int)
     for x, p in profiles:
         counts[x - left : x - left + len(p)] += p
-    inked = np.flatnonzero(counts > len(profiles) * 0.1)
+    inked = np.flatnonzero(counts > len(profiles) / 3)
     if len(inked) < 2:
         return None
-    blank = counts <= len(profiles) * 0.1
+    blank = counts <= len(profiles) / 3
     best: tuple[int, int] | None = None
     start = None
     for i in range(inked[0], inked[-1] + 1):
@@ -2020,12 +2184,12 @@ def _find_ruleless_split(img: np.ndarray, cells: list[Box]) -> int | None:
         return None
     split = left + (best[0] + best[1]) // 2
     both_sides = sum(1 for x, p in profiles if p[: max(0, split - x)].any() and p[max(0, split - x):].any())
-    return split if both_sides >= 0.8 * len(profiles) else None
+    return split if both_sides >= 0.5 * len(profiles) else None
 
 
 def _split_ruleless_columns(
-    img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]],
-) -> tuple[list[list[Box]], list[tuple[int, int]]]:
+    img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]] | None,
+) -> tuple[list[list[Box]], list[tuple[int, int]] | None]:
     """Split a column whose header names two fields but that has no rule
     between them — Kauswagan's Annex D prints "No. of Hours Served" and "No.
     Vacation Service Credits Granted" side by side with nothing in between,
@@ -2045,8 +2209,10 @@ def _split_ruleless_columns(
             if len(_header_fields_all(text)) < 2 or len(_split_header_box(box, grid)) > 1:
                 continue
             x, _, w, _ = box
+            # The header cell counts too: its two labels have the same gap, and
+            # an order for one teacher has only one data row to go on.
             column = [
-                cell for row in grouped[index + 1:] for cell in row
+                cell for row in grouped[index:] for cell in row
                 if min(cell[0] + cell[2], x + w) - max(cell[0], x) >= 0.8 * cell[2]
             ]
             split = _find_ruleless_split(img, column)
@@ -2065,10 +2231,12 @@ def _split_ruleless_columns(
                     out.extend([(bx, by, s - bx, bh), (s, by, bx + bw - s, bh)])
             return out
 
-        new_grid = []
-        for left, right in grid:
-            s = next((s for s in splits if left + 10 < s < right - 10), None)
-            new_grid.extend([(left, s), (s, right)] if s is not None else [(left, right)])
+        new_grid = None
+        if grid:
+            new_grid = []
+            for left, right in grid:
+                s = next((s for s in splits if left + 10 < s < right - 10), None)
+                new_grid.extend([(left, s), (s, right)] if s is not None else [(left, right)])
         return [cut(row) for row in grouped], new_grid
     return grouped, grid
 
@@ -2198,7 +2366,7 @@ def _infer_header_from_content(img: np.ndarray, grouped: list[list[Box]], grid: 
     return mapping, header_boxes
 
 
-def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int, Counter[int]]:
+def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> tuple[list[Form6Row], int, Counter[int]]:
     """Run the full per-page pipeline (table detection through row
     extraction) on one page image. Returns (rows, next seq_start, counts of
     rows no layout could read) — seq is the running row-number counter for
@@ -2210,7 +2378,14 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
     then the fixed layouts this tool knew before either. Nothing is carried
     over from an earlier page — every page is dewarped to its own size and
     offset, so column positions from one don't line up with the next."""
-    default_year = _detect_default_year(img)
+    page_text = _page_text(img)
+    default_year = _detect_default_year(page_text)
+    event = _event_from_text(page_text)
+    if not event and not re.search(r"hereby\s+granted|rendered|special\s+order", page_text, re.IGNORECASE):
+        # A continuation page repeats the table but not the paragraph naming
+        # the event. One that has its own order paragraph is a different order,
+        # though, and never borrows: an unread event beats a wrong one.
+        event = earlier_event
     warped = _dewarp_table(img)
     boxes = _find_cell_boxes(warped)
     grouped = [sorted(row, key=lambda b: b[0]) for row in _group_into_rows(boxes)]
@@ -2218,7 +2393,9 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
     grid = _column_grid(grouped)
     if grid:
         grouped = [_fill_row_to_grid(row, grid) for row in grouped]
-        grouped, grid = _split_ruleless_columns(warped, grouped, grid)
+    # Needs no grid: a one-teacher order has too few rows to agree on one.
+    grouped, grid = _split_ruleless_columns(warped, grouped, grid)
+    if grid:
         grouped = _extend_open_bottom(warped, grouped, grid)
 
     # Read the column labels off the form itself. Only the first few rows are
@@ -2235,12 +2412,27 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
     results: list[Form6Row] = []
     seq = seq_start
     unmatched: Counter[int] = Counter()
-    previous_dates: str | None = None
+    previous: Form6Row | None = None
     for row_boxes in grouped:
+        if header and len(row_boxes) > 1.5 * len(header[1]):
+            # Several rows chained into one: a crooked photo's rows overlap in
+            # height, and grouping by height links them. Reading it would mix
+            # teachers' cells, so it is reported as unreadable instead.
+            unmatched[len(row_boxes)] += 1
+            continue
+        if header and not any(_has_text(warped, box) for box in row_boxes[1:]):
+            # A blank line — pre-numbered forms print a number and nothing else.
+            continue
         if header:
             labels = _fields_for_row(header[0], header[1], row_boxes)
+            figures = [box for box, label in zip(row_boxes, labels) if label in ("hours", "credits")]
+            if figures and not any(_has_text(warped, box) for box in figures):
+                # Every grant states its figures, even if only as "-do-". A
+                # row with neither is a blank line of a pre-printed form,
+                # whatever its name cell's paper grain OCR'd as.
+                continue
             seq += 1
-            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq, previous_dates)
+            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq, previous, event)
         # No readable header (a cropped photo, a table with no header row on
         # this page): fall back to recognising the handful of layouts this
         # tool knew before headers were read, purely by column count.
@@ -2262,8 +2454,8 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
 
         if row_results:
             results.extend(row_results)
-            if row_results[-1].dates_raw and not _DITTO_RE.match(row_results[-1].dates_raw):
-                previous_dates = row_results[-1].dates_raw
+            if row_results[-1].kind == "vsc":
+                previous = row_results[-1]
         elif len(row_boxes) > 1:
             # A row nothing could read: an unlabelled layout, a header row, or
             # a different DepEd form that happens to be a table of names.
@@ -2316,9 +2508,16 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
     seq = 0
     errors: list[str] = []
     unmatched: Counter[int] = Counter()
+    several_tables: list[tuple[str, int]] = []
+    event = ""
     for i, img in enumerate(pages, start=1):
+        img = _upright(img)
+        where = f"Page {i}" if len(pages) > 1 else "This page"
+        tables = _count_table_regions(img)
+        if tables > 1:
+            several_tables.append((where, tables))
         try:
-            page_results, seq, page_unmatched = _extract_page(img, seq)
+            page_results, seq, page_unmatched = _extract_page(img, seq, event)
         except ValueError as e:
             # A page with no detectable table (e.g. a PDF cover/signature
             # page) shouldn't abort a multi-page document — skip it, but
@@ -2327,9 +2526,15 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
             continue
         unmatched.update(page_unmatched)
         results.extend(page_results)
+        event = next((r.event for r in reversed(page_results) if r.event), event)
 
         dropped = sum(page_unmatched.values())
-        where = f"Page {i}" if len(pages) > 1 else "This page"
+        if tables > 1:
+            notes.append(
+                f"{where} shows {tables} separate tables — sheets laid over one another? "
+                "Only one was read, so rows from the others are missing. "
+                "Photograph each page flat on its own and upload them separately."
+            )
         if not page_results and dropped >= _DROPPED_ROWS_WORTH_NOTING:
             notes.append(
                 f"{where}: found a table with {dropped} rows but couldn't read any of them. "
@@ -2342,6 +2547,13 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
             )
 
     if not results:
+        if several_tables:
+            where, tables = several_tables[0]
+            raise ValueError(
+                f"{where} shows {tables} separate tables, overlapping or at different angles, "
+                "and they couldn't be read together. Photograph each page flat on its own, "
+                "with the whole table in frame, and upload them separately."
+            )
         if unmatched:
             layouts = ", ".join(f"{n}-column ({c} rows)" for n, c in sorted(unmatched.items()))
             raise ValueError(

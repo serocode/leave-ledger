@@ -676,18 +676,20 @@ def test_a_half_read_hours_cell_is_not_a_smaller_number(raw, expected):
     assert ocr_form6._normalize_hours(raw) == expected
 
 
-def _fake_pages(page_outcomes):
+def _fake_pages(page_outcomes, tables=1):
     """Drive extract_form6_with_notes with canned per-page results."""
     from collections import Counter
     outcomes = iter(page_outcomes)
 
-    def fake_extract(img, seq):
+    def fake_extract(img, seq, earlier_event=""):
         rows, dropped = next(outcomes)
         return rows, seq, Counter({6: dropped}) if dropped else Counter()
 
     return (
         patch.object(ocr_form6, "_load_pages", lambda path: [None] * len(page_outcomes)),
         patch.object(ocr_form6, "_extract_page", fake_extract),
+        patch.object(ocr_form6, "_count_table_regions", lambda img: tables),
+        patch.object(ocr_form6, "_upright", lambda img: img),
     )
 
 
@@ -698,23 +700,23 @@ def _some_row():
 def test_a_page_that_yields_nothing_is_reported():
     """Sacred Heart page 4: ten grants silently missing from an upload that
     otherwise read fine."""
-    load, extract = _fake_pages([([_some_row()], 1), ([], 11)])
-    with load, extract:
+    load, extract, count, upright = _fake_pages([([_some_row()], 1), ([], 11)])
+    with load, extract, count, upright:
         rows, notes = ocr_form6.extract_form6_with_notes("x.pdf")
     assert len(rows) == 1
     assert len(notes) == 1 and notes[0].startswith("Page 2") and "11 rows" in notes[0]
 
 
 def test_a_page_losing_many_rows_is_reported():
-    load, extract = _fake_pages([([_some_row()] * 5, 4)])
-    with load, extract:
+    load, extract, count, upright = _fake_pages([([_some_row()] * 5, 4)])
+    with load, extract, count, upright:
         _, notes = ocr_form6.extract_form6_with_notes("x.jpg")
     assert len(notes) == 1 and "4 table rows couldn't be read" in notes[0]
 
 
 def test_a_header_and_a_blank_line_are_not_worth_a_note():
-    load, extract = _fake_pages([([_some_row()] * 20, 2)])
-    with load, extract:
+    load, extract, count, upright = _fake_pages([([_some_row()] * 20, 2)])
+    with load, extract, count, upright:
         _, notes = ocr_form6.extract_form6_with_notes("x.jpg")
     assert notes == []
 
@@ -845,20 +847,151 @@ def test_normalize_position(raw, expected):
     assert ocr_form6._normalize_position(raw) == expected
 
 
-def test_multi_section_special_order():
-    """A special order with the same table repeated three times on one page,
-    as Cagayan de Oro City uses. Each section has its own header."""
-    rows = ocr_form6.extract_form6("samples/vsc_multisection_sample.jpeg")
-    vsc_rows = [r for r in rows if r.kind == "vsc"]
-    # 5 rows in first section + 5 in second + 5 in third = 15 total
-    assert len(vsc_rows) == 15
-    # All in May 2026
-    assert all("May" in r.description for r in vsc_rows)
-    # All have hours and credits
-    assert all(r.hours is not None and r.earned for r in vsc_rows)
-    # Row 26 is the first in the third section (index 10)
-    assert vsc_rows[10].last_name == "De La Cerna"
-    assert vsc_rows[10].row_no == "26"
-    # Last row
-    assert vsc_rows[-1].last_name == "Murillo"
-    assert vsc_rows[-1].row_no == "30"
+# --- "-do-" in hours and credits; photos of several sheets -----------------
+
+def _vsc_row_from(texts, previous=None):
+    """Run _extract_vsc_row with each column's OCR text given directly."""
+    boxes = {"name": (0, 0, 10, 10), "dates": (10, 0, 10, 10), "hours": (20, 0, 10, 10), "credits": (30, 0, 10, 10)}
+    by_box = {box: texts[field] for field, box in boxes.items()}
+    cells = {field: [("", box)] for field, box in boxes.items()}
+
+    def fake_ocr(img, box, psm, wl, pad=4):
+        text = by_box[box]
+        if wl == "0123456789.,":
+            # The digits whitelist can't represent "-do-"; it comes back a 0.
+            return "0" if ocr_form6._DITTO_RE.match(text) else text
+        return text
+
+    with patch.object(ocr_form6, "_ocr_cell", fake_ocr), \
+         patch.object(ocr_form6, "_ocr_cell_plain", fake_ocr), \
+         patch.object(ocr_form6, "_ocr_date_cell", lambda img, box: (by_box[box], 0)):
+        return ocr_form6._extract_vsc_row(None, cells, 2026, 1, previous)
+
+
+def test_ditto_hours_and_credits_repeat_the_row_above():
+    """Lapasan's Annex D: row 1 prints May 14-15, 2026 / 16 / 2.5 and every
+    row under it says "-do-" in all three columns."""
+    first = _vsc_row_from({"name": "ALIMATAR, APIDA P.", "dates": "May 14-15, 2026", "hours": "16", "credits": "2.5"})[0]
+    second = _vsc_row_from({"name": "ALON III, NELSON E.", "dates": "-do-", "hours": "-do-", "credits": "-do-"}, first)[0]
+    third = _vsc_row_from({"name": "ROCAMORA, RICA B.", "dates": "-do-", "hours": "-do-", "credits": "-do-"}, second)[0]
+    for row in (second, third):
+        assert (row.date_from, row.date_to) == ("2026-05-14", "2026-05-15")
+        assert row.hours == 16 and row.earned == "2.5"
+        assert row.parse_warning is None and row.in_scope
+
+
+def test_ditto_credits_are_never_read_as_zero():
+    """With no row above to repeat, "-do-" is left blank and flagged — the
+    digits-only read would otherwise record 0 credits."""
+    row = _vsc_row_from({"name": "ALON III, NELSON E.", "dates": "May 14-15, 2026", "hours": "16", "credits": "-do-"})[0]
+    assert row.earned == "" and not row.in_scope
+    assert "-do-" in row.parse_warning
+
+
+def test_several_sheets_in_one_photo_are_counted():
+    import cv2
+    page = np.full((1400, 900, 3), 255, dtype=np.uint8)
+    table = _draw_table(3, 4, cell_w=200, cell_h=80)
+    page[20:20 + table.shape[0], 20:20 + table.shape[1]] = table
+    assert ocr_form6._count_table_regions(page) == 1
+    page[700:700 + table.shape[0], 20:20 + table.shape[1]] = table
+    assert ocr_form6._count_table_regions(page) == 2
+
+
+def test_a_photo_of_several_sheets_says_so():
+    """Rows read off one sheet still leave the others' teachers missing."""
+    load, extract, count, upright = _fake_pages([([_some_row()] * 3, 0)], tables=3)
+    with load, extract, count, upright:
+        rows, notes = ocr_form6.extract_form6_with_notes("x.jpg")
+    assert len(rows) == 3
+    assert len(notes) == 1 and "3 separate tables" in notes[0]
+
+
+def test_a_photo_of_several_sheets_that_reads_nothing_explains_why():
+    load, extract, count, upright = _fake_pages([([], 4)], tables=3)
+    with load, extract, count, upright:
+        with pytest.raises(ValueError, match="3 separate tables.*Photograph each page"):
+            ocr_form6.extract_form6_with_notes("x.jpg")
+
+
+# --- Sideways photos, decimal hours, blank pre-printed rows -----------------
+
+@pytest.mark.parametrize("raw,expected", [("72.52", 72.52), ("113.29", 113.29), ("10.63", 10.63), ("10.00", 10.0), ("l6", 16.0)])
+def test_decimal_hours_keep_their_point(raw, expected):
+    """Kauswagan and Taglimao print hours to two decimals; "72.52" was read
+    as 7252 hours, which lifted the credit ceiling instead of tripping it."""
+    assert ocr_form6._normalize_hours(raw) == expected
+
+
+@pytest.mark.parametrize("osd,shape", [
+    ("Rotate: 270\nOrientation confidence: 15.90\n", (10, 20)),
+    ("Rotate: 90\nOrientation confidence: 17.86\n", (10, 20)),
+    ("Rotate: 180\nOrientation confidence: 3.48\n", (20, 10)),   # Bulua p2 is upright
+    ("Rotate: 0\nOrientation confidence: 22.83\n", (20, 10)),
+])
+def test_only_a_confident_orientation_turns_the_page(osd, shape):
+    page = np.zeros((20, 10, 3), dtype=np.uint8)
+    with patch.object(ocr_form6, "_run_tesseract", lambda img, psm, wl: osd):
+        assert ocr_form6._upright(page).shape[:2] == shape
+
+
+def test_a_missing_orientation_pack_leaves_the_page_alone():
+    page = np.zeros((20, 10, 3), dtype=np.uint8)
+    def boom(img, psm, wl):
+        raise ValueError("Tesseract failed: Failed loading language 'osd'")
+    with patch.object(ocr_form6, "_run_tesseract", boom):
+        assert ocr_form6._upright(page) is page
+
+
+def test_paper_grain_and_rules_are_not_text():
+    rng = np.random.default_rng(0)
+    cell = np.clip(150 + rng.normal(0, 4, (90, 300, 3)), 0, 255).astype(np.uint8)
+    cell[45:47, :] = 0   # a rule dragged through the cell by a crooked row
+    assert not ocr_form6._has_text(cell, (0, 0, 300, 90))
+    written = _page_with_text(90, 300, [("DOTAROT", 20, 60)])
+    assert ocr_form6._has_text(written, (0, 0, 300, 90))
+
+
+def test_a_one_teacher_order_splits_hours_from_credits():
+    """Kauswagan SS 1671: a header and one row, with a signature crossing
+    the row below — too few rows for a grid, and ink in that row's gap."""
+    img = _page_with_text(300, 700, [("No. of Hours", 40, 60), ("No. Vacation", 400, 60),
+                                     ("16", 90, 160), ("2.50", 470, 160)])
+    import cv2
+    cv2.line(img, (0, 250), (700, 230), (0, 0, 0), 6)   # the signature
+    cells = [(0, 0, 700, 100), (0, 100, 700, 100), (0, 200, 700, 100)]
+    split = ocr_form6._find_ruleless_split(img, cells)
+    assert split is not None and 240 < split < 400
+
+
+# --- The event a grant was earned for --------------------------------------
+
+@pytest.mark.parametrize("paragraph,event", [
+    ("The following teachers of KAUSWAGAN NATIONAL HIGH SCHOOL is hereby granted ser-\nvice credits for services "
+     "rendered during DIVISION TRAINING FOR THE STRENGTHENED\nSENIOR HIGH SCHOOL CURRICULUM on JUNE 12-13. 2026 Held in "
+     "Cagayan de Oro", "Division Training for the Strengthened Senior High School Curriculum"),
+    # "ON THE" belongs to the name; "ON JUNE 1-5" ends it.
+    ("service credits for services rendered during REGIONAL TRAINING OF TEACHERS ON THE STRENGTHENED SENIOR HIGH "
+     "SCHOOL CURRICULUM ON JUNE 1-5. 2026.", "Regional Training of Teachers on the Strengthened Senior High School Curriculum"),
+    ("rendered during CAPACITY BUILDING FOR CAMPUS JOURNALISM HELD AT FR. WILLIAM F. MASTERSON S.J. ELEMENTARY "
+     "SCHOOL on May 25-26. 2026.", "Capacity Building for Campus Journalism"),
+    # Pedro Roa's "during" OCR'd in pieces.
+    ("vacation service credits for services rendered duri : 3 uring 2026 SUMMER REMEDIATION PROGRAMS (SRP) from May "
+     "6 to June 2, 2026.", "2026 Summer Remediation Programs (SRP)"),
+    ("service credit rendered during the participation in the conduct of Officiating in the Advance Training Course "
+     "for Troop Leaders on May 11-17,2026 at Baikingon NHS", "Officiating in the Advance Training Course for Troop Leaders"),
+    ("rendered during the Early Registration for SY 2026-2027 on Janauary 31 - February 27, 2026.",
+     "Early Registration for SY 2026-2027"),
+    # A continuation page: a table and no paragraph.
+    ("No. Name Position Inclusive Dates 16 AZURA, LIEZEL A. Teacher I May 6 to May 26, 2026 93 17.484", ""),
+])
+def test_event_from_the_order_paragraph(paragraph, event):
+    assert ocr_form6._event_from_text(paragraph) == event
+
+
+def test_description_names_the_event():
+    assert ocr_form6._vsc_description("Aral Summer Program", "2026-05-06", "2026-05-31", 113.29) == \
+        "Vacation service credits, Aral Summer Program, May 6-31, 2026 (113.29 hrs)"
+    # Without one, the format is what it always was.
+    assert ocr_form6._vsc_description("", "2026-05-06", "2026-06-02", 138) == \
+        "Vacation service credits May 6 - June 2, 2026 (138 hrs)"

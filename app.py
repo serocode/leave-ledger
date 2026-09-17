@@ -509,11 +509,12 @@ PAGE = """
     <h4>{{ title }}</h4>
     {{ caller() }}
     <div class="field-row" style="align-items:flex-end">
-      <div style="flex:2"><input type="file" id="{{ p }}File" accept="image/*,application/pdf"></div>
+      <div style="flex:2"><input type="file" id="{{ p }}File" accept="image/*,application/pdf" multiple></div>
       <div style="flex:none"><button id="{{ p }}Upload" type="button" class="primary">{{ button }}</button></div>
     </div>
     <div id="{{ p }}Status" class="sub" style="margin-bottom:0"></div>
     <div id="{{ p }}Notes"></div>
+    <div id="{{ p }}Sources"></div>
   </div>
 
   <div class="kpis" id="{{ p }}Kpis" style="display:none">
@@ -672,9 +673,15 @@ PAGE = """
         <input id="vscTo" type="date">
       </div>
     </div>
-    <div class="field">
-      <label>Description &amp; authority</label>
-      <input id="vscDescription" placeholder="Vacation service credits May 6 - June 2, 2026 (138 hrs)">
+    <div class="field-row">
+      <div class="field" style="flex:1">
+        <label>Special order number</label>
+        <input id="vscSo" placeholder="e.g. 1673 s. 2026">
+      </div>
+      <div class="field" style="flex:3">
+        <label>Description &amp; authority</label>
+        <input id="vscDescription" placeholder="Vacation service credits, SO No. 1673 s. 2026, May 6 - June 2, 2026 (138 hrs)">
+      </div>
     </div>
     <button type="button" id="vscAddBtn" class="primary" style="width:100%;justify-content:center">
       {{ 'Add credits to HRIS' if submit_enabled else 'Preview payload (dry run)' }}
@@ -1167,6 +1174,22 @@ function busyPanel(target, label, total) {
 // Rows the reader couldn't read at all don't show up as rows, so they are
 // listed here — and kept on screen, unlike the status line, which the
 // matching step overwrites.
+// A special order's number goes right after "Vacation service credits" —
+// "Vacation service credits, SO No. 1673 s. 2026, Aral Summer Program, ...".
+// Any number put there before is replaced; the rest of the description,
+// including anything the user edited, is left as it is.
+function withSoNumber(description, so) {
+  const prefix = 'Vacation service credits';
+  // Commas would split the number from its series ("1673, s. 2026").
+  so = (so || '').replace(/,/g, ' ').replace(/\\s+/g, ' ').trim().replace(/^S[OS]\\s*No\\.?\\s*|^No\\.?\\s*/i, '');
+  // Wherever it sits: before a comma, before "(16 hrs)", or at the end.
+  const cleaned = description.replace(/,\\s*SO No\\. [^,(]*?(?=\\s*\\(|,|$)|^SO No\\. [^,]*,\\s*/, '');
+  if (!so) return cleaned;
+  if (!cleaned.startsWith(prefix)) return `SO No. ${so}, ${cleaned}`;
+  const rest = cleaned.slice(prefix.length).replace(/^,?\\s*/, '');
+  return `${prefix}, SO No. ${so}` + (!rest ? '' : rest.startsWith('(') ? ` ${rest}` : `, ${rest}`);
+}
+
 function showNotes(box, notes) {
   box.innerHTML = notes.length
     ? '<div class="warn-box" style="margin-top:0.75rem"><b>Not everything on this upload could be read.</b>' +
@@ -1377,6 +1400,33 @@ function createReviewWorkspace(p, cfg) {
     updateSummary();
   }
 
+  // One box per uploaded order: several orders can be read in one go, and
+  // each has its own number. It's handwritten, so it's typed, not OCR'd.
+  function renderSources(sources) {
+    const box = $('Sources');
+    if (!sources.length) { box.innerHTML = ''; return; }
+    box.innerHTML =
+      '<div class="field" style="margin-top:0.75rem;margin-bottom:0"><label>Special order number</label>' +
+      '<div class="hint" style="margin:0 0 6px">Handwritten on the order, so type it in &mdash; it&rsquo;s added to the description of that order&rsquo;s rows.</div>' +
+      sources.map((src, i) => `
+        <div class="field-row" style="align-items:center;margin-bottom:6px">
+          <div style="flex:2" class="sub">${escapeHtml(src.name)} · ${src.rows} row${src.rows === 1 ? '' : 's'}</div>
+          <div style="flex:1"><input class="so-number" data-source="${i}" placeholder="SO No. — e.g. 1673 s. 2026"></div>
+        </div>`).join('') + '</div>';
+    box.querySelectorAll('.so-number').forEach(input => {
+      input.addEventListener('input', () => {
+        const source = Number(input.dataset.source);
+        rowEls().forEach(tr => {
+          const row = state.rows[tr.dataset.idx];
+          if (row.draft.source !== source) return;
+          const desc = tr.querySelector('.f-description');
+          desc.value = withSoNumber(desc.value, input.value);
+          row.draft.description = desc.value;
+        });
+      });
+    });
+  }
+
   function renderTable() {
     const tbody = $('Table').querySelector('tbody');
     tbody.innerHTML = '';
@@ -1461,19 +1511,39 @@ function createReviewWorkspace(p, cfg) {
     const fileInput = $('File');
     const status = $('Status');
     const uploadBtn = $('Upload');
-    if (!fileInput.files.length) { status.textContent = 'Choose a file first.'; return; }
-    const busy = busyPanel(status, 'Reading the scan — dewarping the page and OCR-ing each cell...');
+    const files = [...fileInput.files];
+    if (!files.length) { status.textContent = 'Choose a file first.'; return; }
+    $('Sources').innerHTML = '';
+    const reading = 'Reading the scan — dewarping the page and OCR-ing each cell...';
+    // One photo per page is the reliable way to shoot a multi-page order, so
+    // several files are read in turn into one review table. A file that fails
+    // doesn't cost the ones that read; its error becomes a note naming it.
+    const busy = files.length > 1 ? busyPanel(status, `Reading ${files[0].name}...`, files.length) : busyPanel(status, reading);
     uploadBtn.disabled = true;
-    const fd = new FormData();
-    fd.append('file', fileInput.files[0]);
     try {
-      const res = await checkedFetch('/api/ocr?expect=' + cfg.expect, { method: 'POST', body: fd });
-      const data = await res.json();
-      if (data.error) { showNotes($('Notes'), []); busy.done('Error: ' + data.error); return; }
-      state.rows = data.rows.map(r => ({ draft: r, employeeId: null, employeeName: '' }));
-      showNotes($('Notes'), data.notes || []);
+      const rows = [], notes = [], errors = [], sources = [];
+      for (const [i, file] of files.entries()) {
+        busy.step(i, `Reading ${file.name}...`);
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await checkedFetch('/api/ocr?expect=' + cfg.expect, { method: 'POST', body: fd });
+        const data = await res.json();
+        const label = files.length > 1 ? `${file.name}: ` : '';
+        if (data.error) { errors.push(label + data.error); continue; }
+        if (data.rows.length) {
+          sources.push({ name: file.name, rows: data.rows.length });
+          data.rows.forEach(r => { r.source = sources.length - 1; });
+        }
+        rows.push(...data.rows);
+        notes.push(...(data.notes || []).map(n => label + n));
+      }
+      busy.step(files.length);
+      if (!rows.length) { showNotes($('Notes'), []); busy.done('Error: ' + errors.join(' ')); return; }
+      state.rows = rows.map(r => ({ draft: r, employeeId: null, employeeName: '' }));
+      showNotes($('Notes'), [...errors, ...notes]);
       busy.done('');
       renderTable();
+      if (cfg.soNumbers) renderSources(sources);
       await autoMatch(status);
     } catch (err) {
       busy.done(err.message === 'Session expired' ? '' : 'Upload failed: ' + err);
@@ -1607,6 +1677,7 @@ const leaveReview = createReviewWorkspace('form6', {
 // Service credits: every row adds, into "earned".
 const vscReview = createReviewWorkspace('vsc', {
   expect: 'vsc',
+  soNumbers: true,
   rowLabel: d => `<span class="stat" style="font-size:0.6875rem">Vacation service credits` +
                  `${d.hours != null ? ` · ${d.hours} hrs` : ''}</span>`,
   amountStep: 'any',
@@ -1664,13 +1735,19 @@ function suggestVscDescription() {
   if (!from) return;
   const fmt = iso => new Date(iso + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
   const period = !to || to === from ? `${fmt(from)}, ${from.slice(0, 4)}` : `${fmt(from)} - ${fmt(to)}, ${to.slice(0, 4)}`;
-  document.getElementById('vscDescription').value =
-    `Vacation service credits ${period}` + (hours ? ` (${hours} hrs)` : '');
+  document.getElementById('vscDescription').value = withSoNumber(
+    `Vacation service credits ${period}` + (hours ? ` (${hours} hrs)` : ''),
+    document.getElementById('vscSo').value);
 }
 
 ['vscHours', 'vscFactor'].forEach(id => document.getElementById(id).addEventListener('input', recomputeVsc));
 ['vscFrom', 'vscTo'].forEach(id => document.getElementById(id).addEventListener('change', suggestVscDescription));
 document.getElementById('vscDescription').addEventListener('input', () => { vscDescriptionTouched = true; });
+document.getElementById('vscSo').addEventListener('input', () => {
+  const desc = document.getElementById('vscDescription');
+  if (!vscDescriptionTouched) suggestVscDescription();
+  if (vscDescriptionTouched || desc.value) desc.value = withSoNumber(desc.value, document.getElementById('vscSo').value);
+});
 
 document.getElementById('vscAddBtn').addEventListener('click', async () => {
   const result = document.getElementById('vscAddResult');
