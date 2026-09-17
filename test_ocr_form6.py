@@ -843,3 +843,22 @@ def test_a_row_number_breaking_the_count_is_repaired():
 ])
 def test_normalize_position(raw, expected):
     assert ocr_form6._normalize_position(raw) == expected
+
+
+def test_multi_section_special_order():
+    """A special order with the same table repeated three times on one page,
+    as Cagayan de Oro City uses. Each section has its own header."""
+    rows = ocr_form6.extract_form6("samples/vsc_multisection_sample.jpeg")
+    vsc_rows = [r for r in rows if r.kind == "vsc"]
+    # 5 rows in first section + 5 in second + 5 in third = 15 total
+    assert len(vsc_rows) == 15
+    # All in May 2026
+    assert all("May" in r.description for r in vsc_rows)
+    # All have hours and credits
+    assert all(r.hours is not None and r.earned for r in vsc_rows)
+    # Row 26 is the first in the third section (index 10)
+    assert vsc_rows[10].last_name == "De La Cerna"
+    assert vsc_rows[10].row_no == "26"
+    # Last row
+    assert vsc_rows[-1].last_name == "Murillo"
+    assert vsc_rows[-1].row_no == "30"
