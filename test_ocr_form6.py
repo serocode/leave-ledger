@@ -766,3 +766,80 @@ def test_a_merged_header_maps_each_column():
         mapping, boxes = ocr_form6._map_header_row(None, header_boxes, grid)
     assert mapping == {0: "no", 100: "name", 300: "dates", 450: "hours", 600: "credits"}
     assert len(boxes) == 5
+
+
+# --- Kauswagan Annex D: open bottom, ruleless columns, "DO" -----------------
+
+def _page_with_text(height, width, texts):
+    """A white page with black text drawn at (x, baseline y)."""
+    import cv2
+    img = np.full((height, width, 3), 255, dtype=np.uint8)
+    for text, x, y in texts:
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+    return img
+
+
+def test_two_columns_with_no_rule_between_are_split_at_the_gap():
+    """"16" and "3.000" sit in one detected cell per row, 200px apart."""
+    rows = [(0, 60), (60, 60), (120, 60)]
+    img = _page_with_text(180, 500, [(t, x, y + 42) for y, _ in rows for t, x in (("16", 60), ("3.000", 330))])
+    cells = [(0, y, 500, h) for y, h in rows]
+    split = ocr_form6._find_ruleless_split(img, cells)
+    assert split is not None and 110 < split < 330
+
+
+def test_a_word_gap_is_not_a_column():
+    rows = [(0, 60), (60, 60), (120, 60)]
+    img = _page_with_text(180, 500, [("1 DAY", 200, y + 42) for y, _ in rows])
+    assert ocr_form6._find_ruleless_split(img, [(0, y, 500, h) for y, h in rows]) is None
+
+
+def test_rows_below_the_last_closed_cell_are_recovered():
+    """Three closed rows at a 60px pitch, then 120px of unruled table holding
+    two more rows of text."""
+    grid = [(0, 100), (100, 400)]
+    grouped = [[(0, y, 100, 60), (100, y, 300, 60)] for y in (0, 60, 120)]
+    img = _page_with_text(300, 400, [("7", 30, 222), ("CLERIGO, IRENE", 120, 222),
+                                     ("8", 30, 282), ("LABISCASE, S", 120, 282)])
+    out = ocr_form6._extend_open_bottom(img, grouped, grid)
+    assert len(out) == 5
+    assert [row[0][1] for row in out[3:]] == [180, 240]
+
+
+def test_a_closed_table_gains_no_rows():
+    grid = [(0, 100), (100, 400)]
+    grouped = [[(0, y, 100, 60), (100, y, 300, 60)] for y in (0, 60, 120)]
+    img = _page_with_text(182, 400, [])
+    assert ocr_form6._extend_open_bottom(img, grouped, grid) == grouped
+
+
+@pytest.mark.parametrize("raw", ["DO", "do", "D0", "-do-", "Ditto", '"DO"'])
+def test_ditto_marks(raw):
+    assert ocr_form6._DITTO_RE.match(raw)
+
+
+@pytest.mark.parametrize("raw", ["June 12-13, 2026", "", "DOE", "06/12/2026"])
+def test_not_ditto_marks(raw):
+    assert not ocr_form6._DITTO_RE.match(raw)
+
+
+def test_a_row_number_breaking_the_count_is_repaired():
+    """Kauswagan's serif 5 reads as 9, between a 4 and a 6. A form row split
+    into several Form6Rows keeps one number across all of them."""
+    def row(no):
+        return ocr_form6.Form6Row(
+            row_no=no, last_name="X", first_name="Y", middle_initial="", position_raw="",
+            dates_raw="", days_raw="", leave_type="SL", action_taken="WP",
+            date_from=None, date_to=None, description="", used="", parse_warning=None,
+        )
+    rows = [row("4"), row("9"), row("9"), row("6"), row("9")]
+    ocr_form6._repair_row_numbers(rows)
+    assert [r.row_no for r in rows] == ["4", "5", "5", "6", "9"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("TEACHER |", "Teacher I"), ("TEACHER lil", "Teacher III"),
+    ("TEACHER UHI", "Teacher"), ("MASTER TEACHER |", "Master Teacher I"), ("T-III", "T-III"),
+])
+def test_normalize_position(raw, expected):
+    assert ocr_form6._normalize_position(raw) == expected

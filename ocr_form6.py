@@ -616,10 +616,15 @@ def _normalize_position(raw: str) -> str:
     user's own cross-check, so this doesn't need to be perfect."""
     cleaned = raw.strip().upper().replace(" ", "").rstrip(".,-_]['\"")
     # "Teacher I" .. "Teacher V", as grant forms spell the position out.
-    spelled = re.fullmatch(r"TEACHER([IVX1L|!]+)", cleaned)
+    spelled = re.fullmatch(r"(MASTER)?TEACHER([IVX1L|!]+)", cleaned)
+    title = "Master Teacher" if cleaned.startswith("MASTER") else "Teacher"
     if spelled:
-        roman = re.sub(r"[1L|!]", "I", spelled.group(1))
-        return f"Teacher {roman}"
+        roman = re.sub(r"[1L|!]", "I", spelled.group(2))
+        return f"{title} {roman}"
+    if re.match(r"(MASTER)?TEACHER", cleaned):
+        # The numeral under a wrapped "TEACHER" reads as anything ("tt",
+        # "UHI"); a bare "Teacher" beats passing that noise on.
+        return title
     # Adjacent "I"s fuse into an "H" often enough to be worth folding in
     # ("T-HI" is always "T-III", never a real position).
     cleaned = re.sub(r"^T([-_]?)H(?=[I1L|!])", r"T\g<1>II", cleaned)
@@ -1170,7 +1175,7 @@ def _ocr_date_cell(img: np.ndarray, box: tuple[int, int, int, int]) -> tuple[str
     from the first pass, which keeps them. Month-name cells report 0 — their
     parser reads the markers itself."""
     raw = _ocr_cell(img, box, 6, _ABSENCE_DATES_WHITELIST)
-    if _MONTH_IN_TEXT_RE.search(raw):
+    if _MONTH_IN_TEXT_RE.search(raw) or _DITTO_RE.match(raw):
         return raw, 0
     halves = len(re.findall(r"\d\s*\(?\s*(?:AM|PM)\b", raw, re.IGNORECASE))
     # No month name: a numeric cell, whose slashes the first whitelist can't
@@ -1178,6 +1183,10 @@ def _ocr_date_cell(img: np.ndarray, box: tuple[int, int, int, int]) -> tuple[str
     # under the digits-and-slashes whitelist that style was tuned for.
     return _ocr_cell(img, box, 6, _DATE_WHITELIST), halves
 
+
+# "DO" / "ditto" / "-do-": same as the row above. The digits-only re-read
+# can't represent it, so it is caught on the first pass.
+_DITTO_RE = re.compile(r"^\W*(?:D[O0Q]|DITTO)\W*$", re.IGNORECASE)
 
 _MONTH_IN_TEXT_RE = re.compile(
     r"\b(" + "|".join(MONTH_NAMES[1:]) + r"|" + "|".join(m[:3] for m in MONTH_NAMES[1:]) + r")",
@@ -1471,7 +1480,7 @@ def _period_from_dates(raw: str, default_year: int | None) -> tuple[str | None, 
 
 def _extract_vsc_row(
     img: np.ndarray, cells: dict[str, list[tuple[str, tuple[int, int, int, int]]]],
-    default_year: int | None, seq: int,
+    default_year: int | None, seq: int, previous_dates: str | None = None,
 ) -> list[Form6Row]:
     def read_all(field: str, psm: int, whitelist: str | None) -> str:
         # A pen tick or margin line through a column can split one cell into
@@ -1500,6 +1509,9 @@ def _extract_vsc_row(
     # The same two-pass read as a leave row's dates: a whitelist without "/"
     # would turn "02/07/2026" into "02072026".
     dates_raw = _ocr_date_cell(img, cells["dates"][0][1])[0] if cells.get("dates") else ""
+    if previous_dates and _DITTO_RE.match(dates_raw):
+        # Carried down as the text itself, so a run of "DO"s chains.
+        dates_raw = previous_dates
     date_from, date_to, date_warning = _period_from_dates(dates_raw, default_year)
     period_days = (
         (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1 if date_from else None
@@ -1522,7 +1534,8 @@ def _extract_vsc_row(
         last_name=last_name,
         first_name=first_name,
         middle_initial=middle_initial,
-        position_raw=_normalize_position(read_all("position", 7, None)),
+        # psm 6: a grant form wraps "TEACHER / III" onto two lines.
+        position_raw=_normalize_position(read_all("position", 6, None)),
         dates_raw=dates_raw,
         days_raw="",
         leave_type="VSC",
@@ -1545,6 +1558,7 @@ def _extract_vsc_row(
 def _extract_mapped_row(
     img: np.ndarray, row_boxes: list[tuple[int, int, int, int]],
     labels: list[str | None], default_year: int | None, seq: int,
+    previous_dates: str | None = None,
 ) -> list[Form6Row]:
     """Read one data row using the header's own column labels, whatever order
     the school chose to print them in."""
@@ -1554,7 +1568,7 @@ def _extract_mapped_row(
             cells.setdefault(label, []).append(("", box))
 
     if cells.get("hours") or cells.get("credits"):
-        return _extract_vsc_row(img, cells, default_year, seq)
+        return _extract_vsc_row(img, cells, default_year, seq, previous_dates)
 
     def read(field: str, psm: int, whitelist: str | None, index: int = 0) -> str:
         entries = cells.get(field) or []
@@ -1959,6 +1973,138 @@ def _fill_row_to_grid(row: list[Box], grid: list[tuple[int, int]]) -> list[Box]:
     return sorted(filled, key=lambda b: b[0])
 
 
+def _ink_profile(img: np.ndarray, box: Box, pad: int = 6) -> np.ndarray | None:
+    """Per-x "is there text here" for one cell, or None for a blank cell.
+    The pad keeps the cell's own rules out of it."""
+    x, y, w, h = box
+    crop = img[y + pad : y + h - pad, x + pad : x + w - pad]
+    if crop.size == 0:
+        return None
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    if gray.std() < 12:
+        # Otsu on a blank cell turns paper grain into "ink".
+        return None
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Two pixels a column, so a lone speck doesn't count as text.
+    return (ink > 0).sum(axis=0) >= 2
+
+
+def _find_ruleless_split(img: np.ndarray, cells: list[Box]) -> int | None:
+    """Where one detected column is really two with no rule printed between
+    them — the x of a gap that is blank in (nearly) every row and has text on
+    both sides of it in most rows. None if there's no such gap."""
+    profiles = [(b[0] + 6, p) for b in cells if (p := _ink_profile(img, b)) is not None]
+    if len(profiles) < 2:
+        return None
+    left = min(x for x, _ in profiles)
+    right = max(x + len(p) for x, p in profiles)
+    counts = np.zeros(right - left, dtype=int)
+    for x, p in profiles:
+        counts[x - left : x - left + len(p)] += p
+    inked = np.flatnonzero(counts > len(profiles) * 0.1)
+    if len(inked) < 2:
+        return None
+    blank = counts <= len(profiles) * 0.1
+    best: tuple[int, int] | None = None
+    start = None
+    for i in range(inked[0], inked[-1] + 1):
+        if blank[i] and start is None:
+            start = i
+        elif not blank[i] and start is not None:
+            if best is None or i - start > best[1] - best[0]:
+                best = (start, i)
+            start = None
+    # A word gap ("1 DAY") is narrow; two columns' worth of centred text
+    # leaves a wide one.
+    if best is None or best[1] - best[0] < max(20, 0.08 * (right - left)):
+        return None
+    split = left + (best[0] + best[1]) // 2
+    both_sides = sum(1 for x, p in profiles if p[: max(0, split - x)].any() and p[max(0, split - x):].any())
+    return split if both_sides >= 0.8 * len(profiles) else None
+
+
+def _split_ruleless_columns(
+    img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]],
+) -> tuple[list[list[Box]], list[tuple[int, int]]]:
+    """Split a column whose header names two fields but that has no rule
+    between them — Kauswagan's Annex D prints "No. of Hours Served" and "No.
+    Vacation Service Credits Granted" side by side with nothing in between,
+    so every row's "16" and "3.000" arrived as one cell and read as 163000
+    hours. _map_header_row already splits a merged header along the grid;
+    this is for when the grid itself has no line to split along, so the gap
+    in the text beneath is used as the rule instead.
+
+    Only a header naming two fields triggers it: a gap alone could be the
+    space inside a column of identical "1 DAY" cells."""
+    for index, candidate in enumerate(grouped[:3]):
+        texts = [_ocr_cell(img, box, 6, None) for box in candidate]
+        if not any(_header_field(t) for t in texts):
+            continue
+        splits = []
+        for box, text in zip(candidate, texts):
+            if len(_header_fields_all(text)) < 2 or len(_split_header_box(box, grid)) > 1:
+                continue
+            x, _, w, _ = box
+            column = [
+                cell for row in grouped[index + 1:] for cell in row
+                if min(cell[0] + cell[2], x + w) - max(cell[0], x) >= 0.8 * cell[2]
+            ]
+            split = _find_ruleless_split(img, column)
+            if split is not None:
+                splits.append(split)
+        if not splits:
+            return grouped, grid
+
+        def cut(boxes: list[Box]) -> list[Box]:
+            out = []
+            for bx, by, bw, bh in boxes:
+                s = next((s for s in splits if bx + 10 < s < bx + bw - 10), None)
+                if s is None:
+                    out.append((bx, by, bw, bh))
+                else:
+                    out.extend([(bx, by, s - bx, bh), (s, by, bx + bw - s, bh)])
+            return out
+
+        new_grid = []
+        for left, right in grid:
+            s = next((s for s in splits if left + 10 < s < right - 10), None)
+            new_grid.extend([(left, s), (s, right)] if s is not None else [(left, right)])
+        return [cut(row) for row in grouped], new_grid
+    return grouped, grid
+
+
+def _extend_open_bottom(img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]]) -> list[list[Box]]:
+    """Recover rows below the last closed cell of a table whose bottom rules
+    weren't printed or didn't scan. Kauswagan's Annex D runs its column rules
+    down past rows 7-9 with no horizontal line under any of them, so no cell
+    closes there and those three teachers vanished.
+
+    The dewarped page ends where the table's rules do, so whatever height is
+    left below the last row is table. It's cut into rows at the pitch the
+    closed rows keep, and a strip is kept only if it has text in it."""
+    rows = [r for r in grouped if len(r) >= 2]
+    if len(rows) < 3:
+        return grouped
+    centers = [sorted(b[1] + b[3] / 2 for b in r)[len(r) // 2] for r in rows]
+    pitch = sorted(b - a for a, b in zip(centers, centers[1:]))[(len(centers) - 1) // 2]
+    last = rows[-1]
+    bottom = sorted(b[1] + b[3] for b in last)[len(last) // 2]
+    remaining = img.shape[0] - bottom
+    if pitch <= 0:
+        return grouped
+    n = int((remaining + 0.35 * pitch) // pitch)
+    if n < 1:
+        return grouped
+    step = remaining / n
+    added = []
+    for i in range(n):
+        y = int(bottom + i * step)
+        row = [(left, y, right - left, int(step)) for left, right in grid]
+        if sum(_ink_profile(img, b) is not None for b in row) >= 2:
+            added.append(row)
+    return grouped + added
+
+
 # ---------------------------------------------------------------------------
 # Content-based column inference
 #
@@ -2072,6 +2218,8 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
     grid = _column_grid(grouped)
     if grid:
         grouped = [_fill_row_to_grid(row, grid) for row in grouped]
+        grouped, grid = _split_ruleless_columns(warped, grouped, grid)
+        grouped = _extend_open_bottom(warped, grouped, grid)
 
     # Read the column labels off the form itself. Only the first few rows are
     # considered — a header is at the top, and a data row that happens to
@@ -2087,11 +2235,12 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
     results: list[Form6Row] = []
     seq = seq_start
     unmatched: Counter[int] = Counter()
+    previous_dates: str | None = None
     for row_boxes in grouped:
         if header:
             labels = _fields_for_row(header[0], header[1], row_boxes)
             seq += 1
-            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq)
+            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq, previous_dates)
         # No readable header (a cropped photo, a table with no header row on
         # this page): fall back to recognising the handful of layouts this
         # tool knew before headers were read, purely by column count.
@@ -2113,6 +2262,8 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
 
         if row_results:
             results.extend(row_results)
+            if row_results[-1].dates_raw and not _DITTO_RE.match(row_results[-1].dates_raw):
+                previous_dates = row_results[-1].dates_raw
         elif len(row_boxes) > 1:
             # A row nothing could read: an unlabelled layout, a header row, or
             # a different DepEd form that happens to be a table of names.
@@ -2120,7 +2271,27 @@ def _extract_page(img: np.ndarray, seq_start: int) -> tuple[list[Form6Row], int,
             # "0 rows" — only ever read when the document yielded nothing.
             unmatched[len(row_boxes)] += 1
 
+    _repair_row_numbers(results)
     return results, seq, unmatched
+
+
+def _repair_row_numbers(rows: list[Form6Row]) -> None:
+    """A row number that breaks an otherwise unbroken count is a misread —
+    Kauswagan's serif 5 reads as 9 under every OCR mode, between a 4 and a 6.
+    Cosmetic (row numbers never reach HRIS), but a second "9" on a nine-row
+    order makes a correct read look like a duplicate. One form row can yield
+    several Form6Rows sharing its number, so runs are compared, not rows."""
+    runs: list[list[Form6Row]] = []
+    for row in rows:
+        if runs and runs[-1][0].row_no == row.row_no:
+            runs[-1].append(row)
+        else:
+            runs.append([row])
+    for before, run, after in zip(runs, runs[1:], runs[2:]):
+        prev_no, no, next_no = before[0].row_no, run[0].row_no, after[0].row_no
+        if prev_no.isdigit() and next_no.isdigit() and int(next_no) == int(prev_no) + 2 and no != str(int(prev_no) + 1):
+            for row in run:
+                row.row_no = str(int(prev_no) + 1)
 
 
 # A page yielding nothing, or losing most of its rows, is reported rather than
