@@ -4,6 +4,7 @@ Run with:
     pytest test_ocr_form6.py -v
 """
 
+from collections import Counter
 from unittest.mock import patch
 
 import numpy as np
@@ -682,7 +683,10 @@ def _fake_pages(page_outcomes, tables=1):
     outcomes = iter(page_outcomes)
 
     def fake_extract(img, seq, earlier_event=""):
-        rows, dropped = next(outcomes)
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        rows, dropped = outcome
         return rows, seq, Counter({6: dropped}) if dropped else Counter()
 
     return (
@@ -690,6 +694,7 @@ def _fake_pages(page_outcomes, tables=1):
         patch.object(ocr_form6, "_extract_page", fake_extract),
         patch.object(ocr_form6, "_count_table_regions", lambda img: tables),
         patch.object(ocr_form6, "_upright", lambda img: img),
+        patch.object(ocr_form6, "_deskew", lambda img: img),
     )
 
 
@@ -700,23 +705,23 @@ def _some_row():
 def test_a_page_that_yields_nothing_is_reported():
     """Sacred Heart page 4: ten grants silently missing from an upload that
     otherwise read fine."""
-    load, extract, count, upright = _fake_pages([([_some_row()], 1), ([], 11)])
-    with load, extract, count, upright:
+    load, extract, count, upright, deskew = _fake_pages([([_some_row()], 1), ([], 11)])
+    with load, extract, count, upright, deskew:
         rows, notes = ocr_form6.extract_form6_with_notes("x.pdf")
     assert len(rows) == 1
     assert len(notes) == 1 and notes[0].startswith("Page 2") and "11 rows" in notes[0]
 
 
 def test_a_page_losing_many_rows_is_reported():
-    load, extract, count, upright = _fake_pages([([_some_row()] * 5, 4)])
-    with load, extract, count, upright:
+    load, extract, count, upright, deskew = _fake_pages([([_some_row()] * 5, 4)])
+    with load, extract, count, upright, deskew:
         _, notes = ocr_form6.extract_form6_with_notes("x.jpg")
     assert len(notes) == 1 and "4 table rows couldn't be read" in notes[0]
 
 
 def test_a_header_and_a_blank_line_are_not_worth_a_note():
-    load, extract, count, upright = _fake_pages([([_some_row()] * 20, 2)])
-    with load, extract, count, upright:
+    load, extract, count, upright, deskew = _fake_pages([([_some_row()] * 20, 2)])
+    with load, extract, count, upright, deskew:
         _, notes = ocr_form6.extract_form6_with_notes("x.jpg")
     assert notes == []
 
@@ -849,7 +854,7 @@ def test_normalize_position(raw, expected):
 
 # --- "-do-" in hours and credits; photos of several sheets -----------------
 
-def _vsc_row_from(texts, previous=None):
+def _vsc_row_from(texts, previous=None, img=None):
     """Run _extract_vsc_row with each column's OCR text given directly."""
     boxes = {"name": (0, 0, 10, 10), "dates": (10, 0, 10, 10), "hours": (20, 0, 10, 10), "credits": (30, 0, 10, 10)}
     by_box = {box: texts[field] for field, box in boxes.items()}
@@ -865,7 +870,7 @@ def _vsc_row_from(texts, previous=None):
     with patch.object(ocr_form6, "_ocr_cell", fake_ocr), \
          patch.object(ocr_form6, "_ocr_cell_plain", fake_ocr), \
          patch.object(ocr_form6, "_ocr_date_cell", lambda img, box: (by_box[box], 0)):
-        return ocr_form6._extract_vsc_row(None, cells, 2026, 1, previous)
+        return ocr_form6._extract_vsc_row(img, cells, 2026, 1, previous)
 
 
 def test_ditto_hours_and_credits_repeat_the_row_above():
@@ -900,16 +905,16 @@ def test_several_sheets_in_one_photo_are_counted():
 
 def test_a_photo_of_several_sheets_says_so():
     """Rows read off one sheet still leave the others' teachers missing."""
-    load, extract, count, upright = _fake_pages([([_some_row()] * 3, 0)], tables=3)
-    with load, extract, count, upright:
+    load, extract, count, upright, deskew = _fake_pages([([_some_row()] * 3, 0)], tables=3)
+    with load, extract, count, upright, deskew:
         rows, notes = ocr_form6.extract_form6_with_notes("x.jpg")
     assert len(rows) == 3
     assert len(notes) == 1 and "3 separate tables" in notes[0]
 
 
 def test_a_photo_of_several_sheets_that_reads_nothing_explains_why():
-    load, extract, count, upright = _fake_pages([([], 4)], tables=3)
-    with load, extract, count, upright:
+    load, extract, count, upright, deskew = _fake_pages([([], 4)], tables=3)
+    with load, extract, count, upright, deskew:
         with pytest.raises(ValueError, match="3 separate tables.*Photograph each page"):
             ocr_form6.extract_form6_with_notes("x.jpg")
 
@@ -995,3 +1000,175 @@ def test_description_names_the_event():
     # Without one, the format is what it always was.
     assert ocr_form6._vsc_description("", "2026-05-06", "2026-06-02", 138) == \
         "Vacation service credits May 6 - June 2, 2026 (138 hrs)"
+
+
+# --- Tilted scans, pen strokes through cells, blank rows --------------------
+
+def _tilted_table(degrees):
+    """A ruled table (long horizontal and vertical rules) tilted by `degrees`."""
+    import cv2
+    img = _draw_table(6, 5, cell_w=300, cell_h=120)
+    img = cv2.copyMakeBorder(img, 100, 100, 100, 100, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    h, w = img.shape[:2]
+    return cv2.warpAffine(img, cv2.getRotationMatrix2D((w / 2, h / 2), -degrees, 1.0), (w, h),
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+
+
+@pytest.mark.parametrize("degrees", [2.5, -2.0, 1.5])
+def test_a_tilted_page_is_measured_and_straightened(degrees):
+    """SO 1891 tilts 1.5-2.7 degrees; its rules broke into fragments."""
+    img = _tilted_table(degrees)
+    assert ocr_form6._skew_degrees(img) == pytest.approx(degrees, abs=0.4)
+    assert abs(ocr_form6._skew_degrees(ocr_form6._deskew(img))) < 0.4
+
+
+@pytest.mark.parametrize("degrees", [0.0, 0.4, -0.5])
+def test_a_page_barely_tilted_is_left_exactly_as_scanned(degrees):
+    """Every sample that read correctly before sits under 0.6 degrees, so none of
+    them may change."""
+    img = _tilted_table(degrees)
+    assert ocr_form6._deskew(img) is img
+
+
+def test_a_page_with_no_lines_is_left_alone():
+    blank = np.full((400, 300, 3), 255, dtype=np.uint8)
+    assert ocr_form6._skew_degrees(blank) is None and ocr_form6._deskew(blank) is blank
+
+
+def _cell_with_digits(stroke):
+    import cv2
+    img = np.full((160, 340, 3), 235, dtype=np.uint8)
+    cv2.putText(img, "60", (150, 95), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (90, 90, 90), 2)
+    if stroke:
+        cv2.line(img, (140, 0), (128, 160), (10, 10, 10), 9)     # a signature's downstroke
+    return img
+
+
+def test_a_pen_stroke_through_a_cell_is_detected():
+    box = (0, 0, 340, 160)
+    assert ocr_form6._has_pen_stroke(_cell_with_digits(True), [box])
+    assert not ocr_form6._has_pen_stroke(_cell_with_digits(False), [box])
+
+
+def test_a_stroke_splitting_a_cell_into_two_boxes_is_still_found():
+    """The stroke acts as a rule, so the cell arrives as two boxes."""
+    assert ocr_form6._has_pen_stroke(_cell_with_digits(True), [(0, 0, 130, 160), (130, 0, 210, 160)])
+
+
+def test_a_stroke_makes_hours_unread_but_keeps_the_credits():
+    """SO 1891 row 5: "60" under a signature reads as "1" hours, which used to
+    refuse the correctly read 11.251 credits and put "(1 hrs)" in the description."""
+    with patch.object(ocr_form6, "_has_pen_stroke", lambda img, boxes: True):
+        [row] = _vsc_row_from(
+            {"name": "HAGONAO, WINDY G.", "dates": "May 4-29, 2026", "hours": "1", "credits": "11.251"},
+            img=np.zeros((10, 10, 3), dtype=np.uint8),
+        )
+    assert row.hours is None and row.earned == "11.251"
+    assert "hrs" not in row.description
+    assert "pen mark crosses the hours cell" in row.parse_warning
+    assert row.in_scope
+
+
+def test_faint_two_digit_figures_are_not_a_blank_row():
+    """"96" and "18" in wide cells are 0.7-0.9% ink each — under the old
+    per-cell cutoff, so the first teacher of SO 1891 vanished."""
+    import cv2
+    page = np.full((120, 900, 3), 235, dtype=np.uint8)
+    cv2.putText(page, "96", (120, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (70, 70, 70), 2)
+    cv2.putText(page, "18", (620, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (70, 70, 70), 2)
+    boxes = [(0, 0, 450, 120), (450, 0, 450, 120)]
+    assert sum(ocr_form6._ink_percent(page, b) for b in boxes) >= ocr_form6._MIN_FIGURES_INK_PERCENT
+    blank = np.full((120, 900, 3), 235, dtype=np.uint8)
+    assert sum(ocr_form6._ink_percent(blank, b) for b in boxes) < ocr_form6._MIN_FIGURES_INK_PERCENT
+
+
+def test_a_number_broken_at_a_page_edge_is_repaired_across_pages():
+    def grant(no):
+        return ocr_form6.Form6Row(no, "X", "Y", "", "", "", "", "VSC", "", kind="vsc")
+    rows = [grant("4"), grant("6"), grant("6"), grant("7")]    # page 1 ends on a misread 5
+    ocr_form6._repair_row_numbers(rows)
+    assert [r.row_no for r in rows] == ["4", "5", "6", "7"]
+
+
+def test_a_page_with_no_table_is_reported_when_others_read():
+    """SO 1891's page 3 vanished without a word: five teachers gone."""
+    load, extract, count, upright, deskew = _fake_pages([([_some_row()], 0), ValueError("no table")])
+    with load, extract, count, upright, deskew:
+        rows, notes = ocr_form6.extract_form6_with_notes("x.pdf")
+    assert len(rows) == 1
+    assert any(n.startswith("Page 2: no table could be found") for n in notes)
+
+
+def test_bold_digits_in_a_short_row_are_not_a_pen_stroke():
+    """One scan's rows are 38px tall and its bold "4.883 HRS" 24px: over the
+    60%-of-height line first used, so every row's hours were dropped."""
+    import cv2
+    cell = np.full((38, 400, 3), 235, dtype=np.uint8)
+    cv2.putText(cell, "4.883 HRS", (120, 29), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+    assert not ocr_form6._has_pen_stroke(cell, [(0, 0, 400, 38)])
+
+
+def test_a_cells_own_crooked_rule_is_not_a_pen_stroke():
+    cell = _cell_with_digits(False)
+    cell[:, 2:9] = 10          # a thick rule hugging the left edge, full height
+    assert not ocr_form6._has_pen_stroke(cell, [(0, 0, 340, 160)])
+
+
+def test_two_digit_reads_that_agree_outrank_a_misread_seven():
+    """SO 1891 row 7: the free-text read gave "T1" (one hour); the two
+    digit-oriented reads both gave 71."""
+    boxes = {"name": (0, 0, 10, 10), "dates": (10, 0, 10, 10), "hours": (20, 0, 10, 10), "credits": (30, 0, 10, 10)}
+    cells = {field: [("", box)] for field, box in boxes.items()}
+
+    def fake_ocr(img, box, psm, wl, pad=4):
+        return {(0, 0, 10, 10): "JOAQUIN, DISA L.", (10, 0, 10, 10): "May 4-29, 2026", (30, 0, 10, 10): "13.319",
+                (20, 0, 10, 10): "71" if wl == "0123456789." else "T1"}[box]
+
+    def fake_plain(img, box, psm, wl, pad=4):
+        return "71" if box == (20, 0, 10, 10) else fake_ocr(img, box, psm, wl)
+
+    with patch.object(ocr_form6, "_ocr_cell", fake_ocr), patch.object(ocr_form6, "_ocr_cell_plain", fake_plain), \
+         patch.object(ocr_form6, "_ocr_date_cell", lambda img, box: (fake_ocr(img, box, 6, None), 0)):
+        [row] = ocr_form6._extract_vsc_row(None, cells, 2026, 7)
+    assert row.hours == 71 and row.earned == "13.319" and row.parse_warning is None
+
+
+def test_a_tilted_page_is_straightened_only_after_it_reads_nothing_as_scanned():
+    straight, tilted = object(), object()
+    calls = []
+
+    def extract(img, seq, earlier_event=""):
+        calls.append(img)
+        if img is tilted:
+            return [], seq, Counter()          # its rules broke into fragments
+        return [_some_row()], seq + 1, Counter()
+
+    with patch.object(ocr_form6, "_load_pages", lambda path: [tilted]), \
+         patch.object(ocr_form6, "_extract_page", extract), \
+         patch.object(ocr_form6, "_count_table_regions", lambda img: 1), \
+         patch.object(ocr_form6, "_upright", lambda img: img), \
+         patch.object(ocr_form6, "_deskew", lambda img: straight if img is tilted else img):
+        rows, _ = ocr_form6.extract_form6_with_notes("x.pdf")
+    assert len(rows) == 1 and calls == [tilted, straight]
+
+
+def test_a_page_that_reads_as_scanned_is_never_straightened():
+    """Straightening resamples every digit; a page that read fine must not change."""
+    page = object()
+    with patch.object(ocr_form6, "_load_pages", lambda path: [page]), \
+         patch.object(ocr_form6, "_extract_page", lambda img, seq, ev="": ([_some_row()], seq + 1, Counter())), \
+         patch.object(ocr_form6, "_count_table_regions", lambda img: 1), \
+         patch.object(ocr_form6, "_upright", lambda img: img), \
+         patch.object(ocr_form6, "_deskew", lambda img: pytest.fail("straightened a page that read fine")):
+        rows, _ = ocr_form6.extract_form6_with_notes("x.pdf")
+    assert len(rows) == 1
+
+
+def test_a_header_split_uses_a_two_row_grid_when_no_three_row_grid_exists():
+    """SO 1891 page 4: a header and two teachers. Too few rows to trust a grid
+    for reading, but enough to say where "Hours" and "Credits" divide."""
+    row = lambda y: [(0, y, 100, 50), (100, y, 300, 50), (400, y, 200, 50), (600, y, 200, 50)]
+    grouped = [row(0), row(50), row(100)]
+    assert ocr_form6._column_grid(grouped) is not None                        # 3 rows: the usual grid
+    assert ocr_form6._column_grid(grouped[:2]) is None
+    assert ocr_form6._column_grid(grouped[:2], min_rows=2) == [(0, 100), (100, 400), (400, 600), (600, 800)]

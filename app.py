@@ -636,6 +636,31 @@ PAGE = """
   {% endcall %}
 
   <div class="card">
+    <h4>Filed twice? Check HRIS for duplicates</h4>
+    <p class="sub">
+      Reads each matched teacher's ledger and lists any grant HRIS holds more than once
+      (same dates and credits — the wording may differ).
+      Read the special order above first (a scan read again is fine), then check.
+      The oldest copy of each is kept; only the extra copies are offered for removal,
+      and nothing is deleted until you confirm.
+    </p>
+    <button type="button" id="dupCheck" class="accent">Check for duplicates</button>
+    <span id="dupStatus" class="stat" style="margin-left:10px"></span>
+    <div class="table-scroll" id="dupWrap" style="display:none;margin-top:0.85rem">
+      <table id="dupTable">
+        <thead><tr>
+          <th>Employee</th><th>Dates</th><th class="num">Credits</th>
+          <th>Keeps</th><th>Extra copies to remove</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div style="margin-top:0.75rem">
+        <button type="button" id="dupRemove" class="primary">Remove the extra copies</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <h4>Record a single grant</h4>
     <p class="sub">For one teacher, or a row the upload couldn't read.</p>
     <div class="field">
@@ -1591,7 +1616,7 @@ function createReviewWorkspace(p, cfg) {
     const submitStatus = $('SubmitStatus');
     setBtnBusy(submitBtn, `Submitting 1 of ${toSubmit.length}...`);
     progress.classList.remove('indeterminate');
-    let done = 0, failed = 0;
+    let done = 0, failed = 0, skipped = 0;
 
     for (const tr of toSubmit) {
       const row = state.rows[tr.dataset.idx];
@@ -1616,7 +1641,15 @@ function createReviewWorkspace(p, cfg) {
           body: JSON.stringify(body),
         });
         const data = await res.json();
-        if (data.error) {
+        if (data.duplicate) {
+          // HRIS already holds this exact record: nothing to retry, so the row
+          // is settled like a submitted one rather than left ticked as a failure.
+          statusCell.textContent = `Already in HRIS (#${data.record_id}) — not submitted again`;
+          statusCell.className = 'row-status';
+          tr.classList.add('row-done');
+          tr.querySelector('.row-check').checked = false;
+          skipped++;
+        } else if (data.error) {
           statusCell.textContent = 'Failed: ' + data.error;
           statusCell.className = 'row-status err';
           failed++;
@@ -1638,9 +1671,12 @@ function createReviewWorkspace(p, cfg) {
     clearBtnBusy(submitBtn, 'Submit checked rows');
     // Submitted rows untick themselves, so what is left checked is exactly
     // what still needs another go.
-    submitStatus.textContent = failed
-      ? `${done - failed} submitted, ${failed} failed — the failures are still checked.`
-      : `All ${done} submitted.`;
+    const submitted = done - failed - skipped;
+    submitStatus.textContent = [
+      submitted ? `${submitted} submitted` : '',
+      skipped ? `${skipped} already in HRIS (skipped)` : '',
+      failed ? `${failed} failed — the failures are still checked` : '',
+    ].filter(Boolean).join(', ') + '.';
     syncCheckAll();
     updateSummary();
   });
@@ -1687,6 +1723,121 @@ const vscReview = createReviewWorkspace('vsc', {
   extraFilter: null,
   kpi4: (els, checked) => fmtDays(sumAmounts(checked)),
   confirmRows: toSubmit => [['Added to "earned"', `${fmtDays(sumAmounts(toSubmit))} day(s) in total`]],
+});
+
+// ----- Duplicates: a grant filed twice -----
+
+async function checkDuplicates() {
+  const status = document.getElementById('dupStatus');
+  const wrap = document.getElementById('dupWrap');
+  const tbody = wrap.querySelector('tbody');
+  const rows = [...document.querySelectorAll('#vscTable tbody tr')]
+    .map(tr => {
+      const row = vscReview.rows[tr.dataset.idx];
+      return {
+        employee_id: row.employeeId,
+        employee_name: row.employeeName || nameGuess(row.draft),
+        date_from: tr.querySelector('.f-date-from').value,
+        date_to: tr.querySelector('.f-date-to').value,
+        earned: tr.querySelector('.f-amount').value,
+      };
+    })
+    .filter(r => r.employee_id);
+  if (!rows.length) { status.textContent = 'Read a special order and match its teachers first.'; return null; }
+
+  const btn = document.getElementById('dupCheck');
+  setBtnBusy(btn, 'Checking...');
+  const busy = busyPanel(status, `Reading ${new Set(rows.map(r => r.employee_id)).size} ledger(s)...`);
+  let groups;
+  try {
+    const res = await checkedFetch('/api/duplicates', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ rows }),
+    });
+    const data = await res.json();
+    if (data.error) { busy.done('Check failed: ' + data.error); return null; }
+    groups = data.groups || [];
+  } catch (err) {
+    busy.done(err.message === 'Session expired' ? '' : 'Check failed: ' + err);
+    return null;
+  } finally {
+    clearBtnBusy(btn);
+  }
+
+  tbody.innerHTML = '';
+  wrap.style.display = groups.length ? 'block' : 'none';
+  wrap.dataset.groups = JSON.stringify(groups);
+  if (!groups.length) { busy.done('No duplicates — every grant here is in HRIS once.'); return groups; }
+  const extra = groups.reduce((n, g) => n + g.duplicates.length, 0);
+  busy.done(`${extra} extra cop${extra === 1 ? 'y' : 'ies'} found across ${groups.length} grant(s).`);
+  groups.forEach(g => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${escapeHtml(g.employee_name || ('HRIS ID #' + g.employee_id))}</td>
+      <td>${escapeHtml(g.date_from)} &rarr; ${escapeHtml(g.date_to)}</td>
+      <td class="num">${g.earned}</td>
+      <td>#${g.keep.id}<div class="stat">${escapeHtml(g.keep.description)}</div></td>
+      <td>${g.duplicates.map(d => '#' + d.id + '<div class="stat">' + escapeHtml(d.description) + '</div>').join('')}` +
+        (g.same_wording ? '' : '<div class="warn2">The wording differs — read both before removing.</div>') + '</td>';
+    tbody.appendChild(tr);
+  });
+  return groups;
+}
+
+document.getElementById('dupCheck').addEventListener('click', checkDuplicates);
+
+document.getElementById('dupRemove').addEventListener('click', async () => {
+  const wrap = document.getElementById('dupWrap');
+  const groups = JSON.parse(wrap.dataset.groups || '[]');
+  const removals = groups.flatMap(g => g.duplicates.map(d => ({ employee_id: g.employee_id, record_id: d.id, earned: g.earned })));
+  if (!removals.length) return;
+  const status = document.getElementById('dupStatus');
+  const btn = document.getElementById('dupRemove');
+
+  if (SUBMIT_ENABLED) {
+    const people = new Set(removals.map(r => r.employee_id)).size;
+    const ok = await confirmModal({
+      title: `Delete ${removals.length} duplicate record(s) from HRIS?`,
+      rows: [
+        ['Records to delete', `${removals.length} across ${people} employee(s)`],
+        ['Credits taken back off', `${fmtDays(removals.reduce((sum, r) => sum + r.earned, 0))} day(s) in total`],
+        ['Kept', 'the oldest copy of each grant'],
+      ],
+      note: 'This deletes real HRIS records. It cannot be undone from this tool. It stops at the first one HRIS refuses.',
+      confirmText: `Delete ${removals.length} record(s)`,
+    });
+    if (!ok) return;
+  }
+
+  setBtnBusy(btn, 'Removing...');
+  const busy = busyPanel(status, 'Removing duplicates...', removals.length);
+  let removed = 0, problem = '';
+  try {
+    for (const removal of removals) {
+      busy.step(removed, `Removing record #${removal.record_id}...`);
+      const res = await checkedFetch('/api/duplicates/remove', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ removals: [{ employee_id: removal.employee_id, record_id: removal.record_id }] }),
+      });
+      const data = await res.json();
+      const result = (data.results || [])[0];
+      if (data.error || !result || !result.ok) {
+        problem = `Stopped at record #${removal.record_id}: ${data.error || (result && result.error) || 'no answer'}`;
+        break;
+      }
+      removed++;
+    }
+  } catch (err) {
+    problem = err.message === 'Session expired' ? '' : 'Stopped: ' + err;
+  } finally {
+    clearBtnBusy(btn);
+  }
+  busy.done((SUBMIT_ENABLED ? `Removed ${removed} of ${removals.length}.` : `Previewed ${removed} of ${removals.length} (dry run).`) + (problem ? ' ' + problem : ''));
+  // Whatever is left is the truth, not what this page remembers.
+  if (SUBMIT_ENABLED && removed) {
+    const message = status.textContent;
+    await checkDuplicates();
+    status.textContent = message + ' ' + status.textContent;
+  }
 });
 
 // ----- Single grant, by hand -----
@@ -2029,6 +2180,54 @@ def api_balance(employee_id: int):
     )
 
 
+# Held across "is this already recorded?" and the write itself, so two
+# submissions of the same record (a double click, two tabs) can't both pass
+# the check before either has been written.
+_write_lock = threading.Lock()
+
+
+def _record_view(record: dict) -> dict | None:
+    """A ledger record reduced to what identifies it, or None when it isn't
+    a Service Credit record (which is where this tool writes everything)."""
+    attrs = record.get("attributes", record)
+    lct = attrs.get("leave_credit_type") or {}
+    if (lct.get("attributes", lct) or {}).get("leave_credit_type") != "Service Credit":
+        return None
+
+    def amount(value) -> float:
+        try:
+            return round(float(value or 0), 3)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "id": record.get("id"),
+        "description": " ".join((attrs.get("description") or "").split()),
+        "date_from": (attrs.get("date_from") or "")[:10],
+        "date_to": (attrs.get("date_to") or "")[:10],
+        "earned": amount(attrs.get("earned")),
+        "used": amount(attrs.get("used")),
+        "wo_pay": amount(attrs.get("wo_pay")),
+    }
+
+
+def _identity(view: dict) -> tuple:
+    """What makes two records "the same": everything a person would compare."""
+    return (view["description"], view["date_from"], view["date_to"],
+            view["earned"], view["used"], view["wo_pay"])
+
+
+def _same_grant(view: dict) -> tuple:
+    """Looser than _identity: the same teacher, dates and credits, whatever the
+    wording. A grant filed once without an SO number and again with one is the
+    same grant twice, and the strict check would call them different."""
+    return (view["date_from"], view["date_to"], view["earned"], view["used"], view["wo_pay"])
+
+
+def _ledger_views(client, employee_id: int) -> list[dict]:
+    return [v for v in (_record_view(r) for r in client.get_leave_credits(employee_id)) if v]
+
+
 @app.route("/api/add", methods=["POST"])
 def api_add():
     client = _get_client()
@@ -2065,22 +2264,154 @@ def api_add():
     without_pay = bool(body.get("without_pay")) and earned <= 0
 
     try:
-        result = client.create_leave_credit(
-            employee_id=int(body["employee_id"]),
-            leave_credit_type_id=LEAVE_CREDIT_TYPE_IDS["Service Credit"],
-            description=description,
-            date_from=date_from or None,
-            date_to=date_to or None,
-            used=0 if (without_pay or earned > 0) else days,
-            wo_pay=days if without_pay else 0,
-            # The ledger keeps three decimals ("25.944"); a float carried
-            # through JSON can arrive as 25.943999999.
-            earned=round(earned, 3),
-            dry_run=not SUBMIT_ENABLED,
-        )
-    except HrisError as e:
-        return jsonify({"error": str(e)}), 502
+        employee_id = int(body["employee_id"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "employee_id is required."}), 400
+    used_days = 0 if (without_pay or earned > 0) else days
+    wo_pay_days = days if without_pay else 0
+    # The ledger keeps three decimals ("25.944"); a float carried through JSON
+    # can arrive as 25.943999999.
+    earned = round(earned, 3)
+
+    with _write_lock:
+        # Refuse an identical record rather than file it twice: submitting a
+        # special order a second time doubled every teacher's credits. The
+        # ledger is read fresh each time, so this also catches a record made
+        # earlier in the same batch, or in another session.
+        wanted = {
+            "description": " ".join(description.split()), "date_from": date_from[:10], "date_to": date_to[:10],
+            "earned": earned, "used": round(float(used_days), 3), "wo_pay": round(float(wo_pay_days), 3),
+        }
+        try:
+            existing = next((v for v in _ledger_views(client, employee_id) if _identity(v) == _identity(wanted)), None)
+        except HrisError as e:
+            return jsonify({
+                "error": f"Couldn't check the ledger for an identical record, so nothing was submitted: {e}",
+            }), 502
+        if existing:
+            return jsonify({
+                "duplicate": True,
+                "record_id": existing["id"],
+                "error": (
+                    f"HRIS already has this exact record (#{existing['id']}: same description, dates and "
+                    "credits) — not submitted again. If it really is a separate grant, change the description."
+                ),
+            }), 409
+
+        try:
+            result = client.create_leave_credit(
+                employee_id=employee_id,
+                leave_credit_type_id=LEAVE_CREDIT_TYPE_IDS["Service Credit"],
+                description=description,
+                date_from=date_from or None,
+                date_to=date_to or None,
+                used=used_days,
+                wo_pay=wo_pay_days,
+                earned=earned,
+                dry_run=not SUBMIT_ENABLED,
+            )
+        except HrisError as e:
+            return jsonify({"error": str(e)}), 502
     return jsonify({"dry_run": not SUBMIT_ENABLED, "result": result})
+
+
+@app.route("/api/duplicates", methods=["POST"])
+def api_duplicates():
+    """Read-only: find records filed more than once.
+
+    Takes the rows the caller is holding ({employee_id, employee_name,
+    date_from, date_to, earned}) and reads each employee's ledger. Records
+    with the same dates and credits are one grant filed twice — even if the
+    wording differs, which is why each copy's description is returned for the
+    user to read. A group is reported only when it matches one of that
+    employee's rows, so an old, unrelated pair elsewhere in a ledger is never
+    offered up for deletion. The oldest record (lowest id) of each group is
+    the one to keep. Writes nothing."""
+    client = _get_client()
+    if not client:
+        return jsonify({"error": "not logged in"}), 401
+    rows = (request.get_json(silent=True, force=True) or {}).get("rows")
+    if not isinstance(rows, list):
+        return jsonify({"error": "expected a list of rows"}), 400
+
+    wanted: dict[int, dict] = {}
+    for row in rows:
+        try:
+            employee_id = int(row.get("employee_id"))
+            earned = round(float(row.get("earned") or 0), 3)
+        except (TypeError, ValueError):
+            continue
+        entry = wanted.setdefault(employee_id, {"name": row.get("employee_name") or "", "keys": set()})
+        entry["keys"].add(((row.get("date_from") or "")[:10], (row.get("date_to") or "")[:10], earned))
+
+    groups = []
+    for employee_id, entry in wanted.items():
+        try:
+            views = _ledger_views(client, employee_id)
+        except HrisError as e:
+            return jsonify({"error": str(e)}), 502
+        by_grant: dict[tuple, list[dict]] = {}
+        for view in views:
+            by_grant.setdefault(_same_grant(view), []).append(view)
+        for members in by_grant.values():
+            first = members[0]
+            if len(members) < 2 or (first["date_from"], first["date_to"], first["earned"]) not in entry["keys"]:
+                continue
+            members = sorted(members, key=lambda v: v["id"])
+            groups.append({
+                "employee_id": employee_id,
+                "employee_name": entry["name"],
+                "date_from": first["date_from"],
+                "date_to": first["date_to"],
+                "earned": first["earned"],
+                "keep": {"id": members[0]["id"], "description": members[0]["description"]},
+                "duplicates": [{"id": v["id"], "description": v["description"]} for v in members[1:]],
+                "same_wording": len({v["description"] for v in members}) == 1,
+            })
+    return jsonify({"groups": groups})
+
+
+@app.route("/api/duplicates/remove", methods=["POST"])
+def api_duplicates_remove():
+    """Delete duplicate records — never the last copy.
+
+    Takes [{employee_id, record_id}]. Each is checked against the ledger as it
+    is *now*: the record must still be there and have an older copy of the
+    same grant (same dates and credits), so a stale list, a wrong id, or a
+    record someone has since edited can't take anything else with it. Stops at the first failure, and reads
+    the ledger back after each delete to confirm the record is really gone."""
+    client = _get_client()
+    if not client:
+        return jsonify({"error": "not logged in"}), 401
+    removals = (request.get_json(silent=True, force=True) or {}).get("removals")
+    if not isinstance(removals, list) or not removals:
+        return jsonify({"error": "expected a list of removals"}), 400
+
+    results = []
+    with _write_lock:
+        for removal in removals:
+            try:
+                employee_id, record_id = int(removal.get("employee_id")), int(removal.get("record_id"))
+            except (TypeError, ValueError, AttributeError):
+                results.append({"record_id": None, "ok": False, "error": "employee_id and record_id are required."})
+                break
+            try:
+                views = _ledger_views(client, employee_id)
+                target = next((v for v in views if v["id"] == record_id), None)
+                if target is None:
+                    raise HrisError(f"Record #{record_id} isn't in this employee's ledger (already removed?).")
+                if not any(v["id"] < record_id and _same_grant(v) == _same_grant(target) for v in views):
+                    raise HrisError(
+                        f"Record #{record_id} has no older copy of the same grant — it is not a duplicate, so it was left alone."
+                    )
+                client.delete_leave_credit(record_id, dry_run=not SUBMIT_ENABLED)
+                if SUBMIT_ENABLED and any(v["id"] == record_id for v in _ledger_views(client, employee_id)):
+                    raise HrisError(f"HRIS accepted the delete, but record #{record_id} is still in the ledger.")
+            except HrisError as e:
+                results.append({"record_id": record_id, "ok": False, "error": str(e)})
+                break
+            results.append({"record_id": record_id, "ok": True})
+    return jsonify({"dry_run": not SUBMIT_ENABLED, "results": results})
 
 
 @app.route("/api/wop-audit", methods=["POST"])

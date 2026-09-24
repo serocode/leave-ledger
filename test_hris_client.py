@@ -439,3 +439,24 @@ def test_a_leave_record_keeps_its_confirmed_shape(client):
         date_from="2026-07-02", date_to="2026-07-02", used=1, dry_run=True,
     )["data"]
     assert data["used"] == "1" and data["earned"] == 0 and not isinstance(data["earned"], str)
+
+
+def test_delete_dry_run_sends_nothing(client):
+    with patch.object(client._session, "delete") as mock_delete:
+        out = client.delete_leave_credit(204041, dry_run=True)
+    mock_delete.assert_not_called()
+    assert out["method"] == "DELETE" and out["path"] == "/leave-credits/204041"
+
+
+def test_delete_sends_the_record_id_and_accepts_an_empty_reply(client):
+    resp = MagicMock(status_code=204, content=b"")
+    with patch.object(client._session, "delete", return_value=resp) as mock_delete:
+        assert client.delete_leave_credit(204041, dry_run=False) == {}
+    assert mock_delete.call_args[0][0].endswith("/leave-credits/204041")
+
+
+def test_a_refused_delete_raises(client):
+    resp = MagicMock(status_code=403, text="Forbidden", content=b"x")
+    with patch.object(client._session, "delete", return_value=resp):
+        with pytest.raises(HrisError, match=r"Delete failed \(403\)"):
+            client.delete_leave_credit(204041, dry_run=False)

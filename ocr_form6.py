@@ -1592,12 +1592,28 @@ def _extract_vsc_row(
     ditto_notes = []
     # psm 6: "31 HOURS & 37 MINUTES" wraps over three lines in its cell.
     hours_raw = read_all("hours", 6, None)
-    if _DITTO_RE.match(hours_raw):
+    if img is not None and _has_pen_stroke(img, [box for _, box in cells.get("hours") or []]):
+        # Left unread, not guessed: the credits (a separate cell) are still
+        # taken as printed, and no invented "(1 hrs)" reaches the description.
+        hours = None
+        ditto_notes.append("A pen mark crosses the hours cell, so hours weren't read — check them against the paper.")
+    elif _DITTO_RE.match(hours_raw):
         hours = previous.hours if previous else None
         if hours is None:
             ditto_notes.append("Hours are \"-do-\" but the row above had none to repeat — enter them from the paper.")
     else:
         hours = _normalize_hours(hours_raw)
+        if not re.search(r"[HM]", hours_raw.upper()):
+            # A plain number ("71"), not "4 HRS & 53 MINS": the free-text read
+            # can turn a 7 into a T ("T1" -> 1 hour) where a read told to
+            # expect digits does not. Two digit reads that agree outrank one
+            # that doesn't; a single dissent, or reads that disagree, change
+            # nothing.
+            first = " ".join(_ocr_cell(img, box, 7, "0123456789.").strip() for _, box in cells.get("hours") or [])
+            second = " ".join(_ocr_cell_plain(img, box, 6, None).strip() for _, box in cells.get("hours") or [])
+            digit_reads = (_normalize_hours(first), _normalize_hours(second))
+            if digit_reads[0] is not None and digit_reads[0] == digit_reads[1] != hours:
+                hours = digit_reads[0]
     credit_boxes = [box for _, box in cells.get("credits") or []]
     credit_wl = "0123456789.,"
     # Read once without the digits whitelist first: under it "-do-" comes
@@ -2048,6 +2064,51 @@ def _upright(img: np.ndarray) -> np.ndarray:
     return cv2.rotate(img, code) if code is not None else img
 
 
+# A page tilted less than this is left exactly as scanned: every sample that
+# read correctly before sits under 0.6 degrees, so nothing that worked can
+# change. Puerto NHS's SO 1891 tilts 1.5-2.7, and its tables' rules broke into
+# fragments.
+_MIN_SKEW_DEGREES = 1.0
+
+
+def _skew_degrees(img: np.ndarray) -> float | None:
+    """How far the page is rotated, from its long straight lines (the table's
+    rules, the paper's edge): the length-weighted median deviation from
+    horizontal/vertical. Positive means the lines run down to the right. None
+    when there aren't enough lines to say."""
+    h, w = img.shape[:2]
+    scale = min(1.0, 1600 / max(h, w))
+    small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else img
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 50, 150)
+    sh, sw = gray.shape
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 720, threshold=120, minLineLength=int(0.12 * min(sh, sw)), maxLineGap=15)
+    if lines is None:
+        return None
+    devs, lengths = [], []
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
+        deviation = (np.degrees(np.arctan2(y2 - y1, x2 - x1)) + 45) % 90 - 45
+        if abs(deviation) <= 8:     # more than that is a diagonal, not a rule
+            devs.append(deviation)
+            lengths.append(np.hypot(x2 - x1, y2 - y1))
+    if len(devs) < 8:
+        return None
+    order = np.argsort(devs)
+    devs, lengths = np.array(devs)[order], np.array(lengths)[order]
+    return float(devs[np.searchsorted(np.cumsum(lengths), lengths.sum() / 2)])
+
+
+def _deskew(img: np.ndarray) -> np.ndarray:
+    """Straighten a page tilted more than _MIN_SKEW_DEGREES; leave others be."""
+    angle = _skew_degrees(img)
+    if angle is None or abs(angle) < _MIN_SKEW_DEGREES:
+        return img
+    h, w = img.shape[:2]
+    matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, matrix, (w, h), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+
+
 def _resolve_leave_type(type_raw: str | None, raw_action: str) -> tuple[str, str]:
     """(leave type, action) for one row. `type_raw` is None when the form has
     no Type of Leave column at all.
@@ -2078,14 +2139,14 @@ def _resolve_leave_type(type_raw: str | None, raw_action: str) -> tuple[str, str
 Box = tuple[int, int, int, int]
 
 
-def _column_grid(grouped: list[list[Box]]) -> list[tuple[int, int]] | None:
+def _column_grid(grouped: list[list[Box]], min_rows: int = 3) -> list[tuple[int, int]] | None:
     """Column x-ranges (left, right) the table's most common row shape agrees
     on, or None when there aren't enough complete rows to trust."""
     counts = Counter(len(r) for r in grouped if len(r) > 1)
     if not counts:
         return None
     width, seen = counts.most_common(1)[0]
-    if seen < 3:
+    if seen < min_rows:
         return None
     rows = [r for r in grouped if len(r) == width]
     grid = []
@@ -2131,23 +2192,66 @@ def _ink_profile(img: np.ndarray, box: Box, pad: int = 6) -> np.ndarray | None:
     return (ink > 0).sum(axis=0) >= 2
 
 
-def _has_text(img: np.ndarray, box: Box, min_percent: float = 1.0, pad: int = 6) -> bool:
-    """Whether a cell holds writing, not just paper grain or a stray rule.
-
-    Tesseract finds letters in noise: the empty pre-printed rows of a grainy
-    Macabalan photo came back as "Nnn, Nnn Eee An". Dark pixels are counted
-    against the cell's own paper tone, after removing long straight strokes —
-    the table's rules, which a crooked row can drag into its cells."""
+def _ink_percent(img: np.ndarray, box: Box, pad: int = 6) -> float:
+    """Share of a cell (in percent) that is writing: dark against the cell's
+    own paper tone, with the table's rules removed — long straight strokes a
+    crooked row can drag into a cell. Paper grain and a rule score about 0."""
     x, y, w, h = box
     crop = img[y + pad : y + h - pad, x + pad : x + w - pad]
     if crop.size == 0:
-        return False
+        return 0.0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     dark = (gray < np.median(gray) - 60).astype(np.uint8)
     ch, cw = dark.shape
     lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, cw // 3), 1)))
     lines |= cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(ch * 0.8)))))
-    return float((dark & (1 - lines)).mean()) * 100 >= min_percent
+    return float((dark & (1 - lines)).mean()) * 100
+
+
+def _has_text(img: np.ndarray, box: Box, min_percent: float = 1.0) -> bool:
+    """Whether a cell holds writing, not just paper grain or a stray rule.
+
+    Tesseract finds letters in noise: the empty pre-printed rows of a grainy
+    Macabalan photo came back as "Nnn, Nnn Eee An"."""
+    return _ink_percent(img, box) >= min_percent
+
+
+# The hours and credits cells of a real grant together hold at least 1.6%
+# (SO 1891's "96" and "18", the faintest so far — each cell alone is under
+# 1.0); a blank pre-printed row's total is 0.0.
+_MIN_FIGURES_INK_PERCENT = 0.8
+
+
+def _has_pen_stroke(img: np.ndarray, boxes: list[Box], pad: int = 4) -> bool:
+    """Whether a thick pen stroke crosses the cell (or the cells one split
+    into): a mark that runs the cell's full height and is much thicker than
+    any printed digit's stroke. A signature's downstroke is drawn straight through the
+    rows of these orders, and what Tesseract makes of the digits under it is
+    not a reading — "60" came back as "1", "16" as "6"."""
+    if not boxes:
+        return False
+    x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+    x1, y1 = max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)
+    crop = img[y0 + pad : y1 - pad, x0 + pad : x1 - pad]
+    if crop.size == 0:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    dark = (gray < np.median(gray) - 70).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    edge = max(6, int(0.03 * crop.shape[1]))
+    for i in range(1, n):
+        left, top, width, height, _ = stats[i]
+        # Edge to edge: a digit is never as tall as its cell, even in a short
+        # row (the bold "4.883 HRS" of one scan is 60% of its 38px cell).
+        if height < 0.85 * crop.shape[0] or top > 0.1 * crop.shape[0] or top + height < 0.9 * crop.shape[0]:
+            continue
+        if left <= edge or left + width >= crop.shape[1] - edge:
+            # The cell's own rule, crooked or thick — not a mark across it.
+            continue
+        thickness = cv2.distanceTransform((labels == i).astype(np.uint8), cv2.DIST_L2, 3).max()
+        if thickness >= 2.5:
+            return True
+    return False
 
 
 def _find_ruleless_split(img: np.ndarray, cells: list[Box]) -> int | None:
@@ -2402,8 +2506,12 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
     # considered — a header is at the top, and a data row that happens to
     # contain a word shouldn't be mistaken for one further down.
     header = None
+    # A short page (a header and two teachers) has too few rows to trust a grid
+    # for reading cells, but two are enough to say where a merged header —
+    # "No. of Hours Served" and "No. Vacation Service Credits" — divides.
+    header_grid = grid or _column_grid(grouped, min_rows=2)
     for candidate in grouped[:3]:
-        header = _map_header_row(warped, candidate, grid)
+        header = _map_header_row(warped, candidate, header_grid)
         if header:
             break
     if header is None and grid:
@@ -2426,7 +2534,7 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
         if header:
             labels = _fields_for_row(header[0], header[1], row_boxes)
             figures = [box for box, label in zip(row_boxes, labels) if label in ("hours", "credits")]
-            if figures and not any(_has_text(warped, box) for box in figures):
+            if figures and sum(_ink_percent(warped, box) for box in figures) < _MIN_FIGURES_INK_PERCENT:
                 # Every grant states its figures, even if only as "-do-". A
                 # row with neither is a blank line of a pre-printed form,
                 # whatever its name cell's paper grain OCR'd as.
@@ -2475,7 +2583,9 @@ def _repair_row_numbers(rows: list[Form6Row]) -> None:
     several Form6Rows sharing its number, so runs are compared, not rows."""
     runs: list[list[Form6Row]] = []
     for row in rows:
-        if runs and runs[-1][0].row_no == row.row_no:
+        # A leave row can yield several records sharing its number; a grant
+        # never does, so two grants in a row with one number are a misread.
+        if runs and runs[-1][0].row_no == row.row_no and row.kind != "vsc":
             runs[-1].append(row)
         else:
             runs.append([row])
@@ -2509,6 +2619,7 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
     errors: list[str] = []
     unmatched: Counter[int] = Counter()
     several_tables: list[tuple[str, int]] = []
+    failed_pages: list[int] = []
     event = ""
     for i, img in enumerate(pages, start=1):
         img = _upright(img)
@@ -2517,12 +2628,35 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
         if tables > 1:
             several_tables.append((where, tables))
         try:
-            page_results, seq, page_unmatched = _extract_page(img, seq, event)
+            try:
+                page_results, next_seq, page_unmatched = _extract_page(img, seq, event)
+                first_error = None
+            except ValueError as e:
+                page_results, next_seq, page_unmatched, first_error = [], seq, Counter(), e
+            if not page_results:
+                # Nothing read as scanned. If the page is tilted, its rules may
+                # have broken into fragments (SO 1891 tilts 1.5-2.7 degrees):
+                # straighten it and try once more. Only ever after a failure,
+                # because straightening resamples every digit — and a page that
+                # read fine must keep reading exactly as it did.
+                straight = _deskew(img)
+                if straight is not img:
+                    try:
+                        retry = _extract_page(straight, seq, event)
+                    except ValueError:
+                        retry = None
+                    if retry and retry[0]:
+                        page_results, next_seq, page_unmatched = retry
+                        first_error = None
+            if first_error is not None:
+                raise first_error
+            seq = next_seq
         except ValueError as e:
             # A page with no detectable table (e.g. a PDF cover/signature
             # page) shouldn't abort a multi-page document — skip it, but
             # surface the reason if it turns out no page had a table at all.
             errors.append(f"page {i}: {e}")
+            failed_pages.append(i)
             continue
         unmatched.update(page_unmatched)
         results.extend(page_results)
@@ -2546,6 +2680,17 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
                 "Count this page's rows against the paper."
             )
 
+    # Per page it can't see a number at a page's edge, whose neighbour is on the
+    # next page. Harmless twice over: it only fixes a number breaking a count.
+    _repair_row_numbers(results)
+    if results and failed_pages:
+        # Not silently: a page whose table can't be found is teachers missing.
+        # (A cover or signature page has no table either, and costs only this
+        # one line.)
+        notes.extend(
+            f"Page {n}: no table could be found on it, so nothing from it is in the review table."
+            for n in failed_pages
+        )
     if not results:
         if several_tables:
             where, tables = several_tables[0]

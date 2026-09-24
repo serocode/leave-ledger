@@ -356,6 +356,27 @@ class HrisClient:
             raise HrisError(f"Update failed ({resp.status_code}): {resp.text[:500]}")
         return resp.json()
 
+    def delete_leave_credit(self, record_id: int, *, dry_run: bool = True) -> dict[str, Any]:
+        """Delete one leave-credit record — for a duplicate filed twice.
+
+        NOT yet confirmed against a real HRIS delete: this is the standard
+        Strapi route for the record path that create (POST) and update (PUT)
+        are confirmed on, so it is expected to work. Nothing here assumes it
+        did — the caller re-reads the ledger to check the record is really
+        gone, and a refusal (403, 404) comes back as an HrisError.
+
+        `dry_run=True` (the default) returns what would be sent and sends
+        nothing."""
+        self._require_auth()
+        if dry_run:
+            print(f"[DRY RUN] Would DELETE /api/leave-credits/{record_id}")
+            return {"method": "DELETE", "path": f"/leave-credits/{record_id}"}
+
+        resp = self._session.delete(f"{BASE_URL}/leave-credits/{record_id}")
+        if resp.status_code not in (200, 204):
+            raise HrisError(f"Delete failed ({resp.status_code}): {resp.text[:500]}")
+        return resp.json() if resp.content else {}
+
 
 # Known leave credit type IDs, captured from real data — extend as you
 # confirm more (e.g. "Vacation Leave Credit", "Sick Leave Credit", "CTO Leave Credit").

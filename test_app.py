@@ -89,12 +89,45 @@ def test_match_skips_blank_names(client):
 # ---- /api/add: paid vs without-pay routing ----
 
 class RecordingClient:
+    """Behaves like HRIS: what is created shows up in that employee's ledger."""
+
     def __init__(self):
         self.calls = []
+        self.ledger = {}          # employee_id -> [record, ...] in HRIS's shape
+        self.deleted = []
+        self.next_id = 1000
+        self.fail_ledger = False
+        self.ignore_deletes = False
+
+    def _add(self, employee_id, description, date_from, date_to, earned=0, used=0, wo_pay=0):
+        self.next_id += 1
+        self.ledger.setdefault(employee_id, []).append({
+            "id": self.next_id,
+            "attributes": {
+                "description": description, "date_from": date_from, "date_to": date_to,
+                "earned": earned, "used": used, "wo_pay": wo_pay,
+                "leave_credit_type": {"leave_credit_type": "Service Credit"},
+            },
+        })
+        return self.next_id
+
+    def get_leave_credits(self, employee_id):
+        if self.fail_ledger:
+            raise HrisError("HRIS is down")
+        return list(self.ledger.get(employee_id, []))
 
     def create_leave_credit(self, **kwargs):
         self.calls.append(kwargs)
+        self._add(kwargs["employee_id"], kwargs["description"], kwargs["date_from"], kwargs["date_to"],
+                  kwargs.get("earned", 0), kwargs.get("used", 0), kwargs.get("wo_pay", 0))
         return {"ok": True}
+
+    def delete_leave_credit(self, record_id, dry_run=True):
+        self.deleted.append((record_id, dry_run))
+        if not dry_run and not self.ignore_deletes:
+            for records in self.ledger.values():
+                records[:] = [r for r in records if r["id"] != record_id]
+        return {}
 
 
 @pytest.fixture
@@ -413,3 +446,190 @@ def test_the_page_defines_the_submit_switch_every_write_path_reads(client):
     script = html[html.index("<script>"):]
     assert script.count("const SUBMIT_ENABLED =") == 1
     assert script.index("const SUBMIT_ENABLED =") < script.index("createReviewWorkspace('form6'")
+
+
+# --- Refusing to file the same record twice ----------------------------------
+
+GRANT = {
+    "employee_id": 7, "description": "Vacation service credits, SO No. 1673 s. 2026, Division Training, June 12-13, 2026 (16 hrs)",
+    "date_from": "2026-06-12", "date_to": "2026-06-13", "earned": "3",
+}
+
+
+def test_an_identical_grant_is_refused_the_second_time(add_client):
+    """SO 1673 was submitted twice and every teacher got 6.000, not 3.000."""
+    test_client, recorder = add_client
+    first = test_client.post("/api/add", json=dict(GRANT))
+    second = test_client.post("/api/add", json=dict(GRANT))
+    assert first.status_code == 200
+    assert second.status_code == 409
+    body = second.get_json()
+    assert body["duplicate"] is True and body["record_id"] == 1001 and "already has this exact record" in body["error"]
+    assert len(recorder.calls) == 1
+
+
+def test_a_second_submit_is_refused_even_after_a_page_reload(add_client):
+    """The check reads HRIS, not the page: nothing the browser forgets matters."""
+    test_client, recorder = add_client
+    recorder._add(7, GRANT["description"], "2026-06-12", "2026-06-13", earned=3)   # made in an earlier session
+    assert test_client.post("/api/add", json=dict(GRANT)).status_code == 409
+    assert recorder.calls == []
+
+
+def test_whitespace_and_datetime_forms_dont_hide_a_duplicate(add_client):
+    test_client, recorder = add_client
+    recorder._add(7, "  Vacation   service credits  ", "2026-06-12T00:00:00.000Z", "2026-06-13T09:00:00.000Z", earned=3.0)
+    body = {**GRANT, "description": "Vacation service credits"}
+    assert test_client.post("/api/add", json=body).status_code == 409
+
+
+@pytest.mark.parametrize("change", [
+    {"description": "Vacation service credits, SO No. 1674 s. 2026"},   # another order
+    {"date_to": "2026-06-14"},
+    {"earned": "3.5"},
+    {"employee_id": 8},                                                  # another teacher
+])
+def test_a_genuinely_different_record_is_not_refused(add_client, change):
+    test_client, recorder = add_client
+    test_client.post("/api/add", json=dict(GRANT))
+    assert test_client.post("/api/add", json={**GRANT, **change}).status_code == 200
+
+
+def test_nothing_is_submitted_when_the_ledger_cant_be_checked(add_client):
+    """Fail closed: not knowing whether it is a duplicate is not a reason to write."""
+    test_client, recorder = add_client
+    recorder.fail_ledger = True
+    resp = test_client.post("/api/add", json=dict(GRANT))
+    assert resp.status_code == 502 and "nothing was submitted" in resp.get_json()["error"]
+    assert recorder.calls == []
+
+
+def test_leave_records_are_held_to_the_same_rule(add_client):
+    test_client, recorder = add_client
+    assert test_client.post("/api/add", json=dict(ADD_BODY)).status_code == 200
+    assert test_client.post("/api/add", json=dict(ADD_BODY)).status_code == 409
+    # A half day and a full day on the same date are different records.
+    assert test_client.post("/api/add", json={**ADD_BODY, "used": "0.5"}).status_code == 200
+
+
+# --- Finding and removing duplicates ------------------------------------------
+
+def _doubled(recorder, employees=(7, 8, 9)):
+    """SO 1673 filed twice for each teacher: ids 1001/1002, 1003/1004, ..."""
+    for emp in employees:
+        for _ in range(2):
+            recorder._add(emp, GRANT["description"], "2026-06-12", "2026-06-13", earned=3)
+
+
+def _rows(*employees):
+    return [{"employee_id": e, "employee_name": f"Teacher {e}", "date_from": "2026-06-12",
+             "date_to": "2026-06-13", "earned": 3} for e in employees]
+
+
+def test_the_finder_lists_each_doubled_record_and_keeps_the_oldest(add_client):
+    test_client, recorder = add_client
+    _doubled(recorder)
+    groups = test_client.post("/api/duplicates", json={"rows": _rows(7, 8, 9)}).get_json()["groups"]
+    assert [(g["employee_id"], g["keep"]["id"], [d["id"] for d in g["duplicates"]]) for g in groups] == [
+        (7, 1001, [1002]), (8, 1003, [1004]), (9, 1005, [1006])]
+    assert all(g["same_wording"] for g in groups)
+    assert recorder.deleted == []          # read-only
+
+
+def test_the_finder_ignores_duplicates_unrelated_to_the_upload(add_client):
+    """An old identical pair in a ledger is not this mistake's to clean up."""
+    test_client, recorder = add_client
+    recorder._add(7, "NMRAA MEET 2026", "2026-01-17", "2026-03-24", earned=28.5)
+    recorder._add(7, "NMRAA MEET 2026", "2026-01-17", "2026-03-24", earned=28.5)
+    recorder._add(7, GRANT["description"], "2026-06-12", "2026-06-13", earned=3)
+    assert test_client.post("/api/duplicates", json={"rows": _rows(7)}).get_json()["groups"] == []
+
+
+def test_the_finder_reports_nothing_when_nothing_is_doubled(add_client):
+    test_client, recorder = add_client
+    test_client.post("/api/add", json=dict(GRANT))
+    assert test_client.post("/api/duplicates", json={"rows": _rows(7)}).get_json()["groups"] == []
+
+
+def test_removing_a_duplicate_deletes_it_and_leaves_the_original(add_client):
+    test_client, recorder = add_client
+    _doubled(recorder, (7,))
+    resp = test_client.post("/api/duplicates/remove", json={"removals": [{"employee_id": 7, "record_id": 1002}]})
+    assert resp.get_json()["results"] == [{"record_id": 1002, "ok": True}]
+    assert [r["id"] for r in recorder.ledger[7]] == [1001]
+    assert recorder.deleted == [(1002, False)]
+
+
+def test_the_original_is_never_removed(add_client):
+    """Asking for the oldest copy — or a record with no older copy — deletes nothing."""
+    test_client, recorder = add_client
+    _doubled(recorder, (7,))
+    recorder._add(7, "NMRAA MEET 2026", "2026-01-17", "2026-03-24", earned=28.5)   # unique
+    for record_id in (1001, 1003):
+        result = test_client.post("/api/duplicates/remove",
+                                  json={"removals": [{"employee_id": 7, "record_id": record_id}]}).get_json()["results"][0]
+        assert result["ok"] is False and "not a duplicate" in result["error"]
+    assert recorder.deleted == [] and len(recorder.ledger[7]) == 3
+
+
+def test_removing_a_record_from_the_wrong_employee_deletes_nothing(add_client):
+    test_client, recorder = add_client
+    _doubled(recorder, (7, 8))
+    result = test_client.post("/api/duplicates/remove",
+                              json={"removals": [{"employee_id": 8, "record_id": 1002}]}).get_json()["results"][0]
+    assert result["ok"] is False and "isn't in this employee's ledger" in result["error"]
+    assert recorder.deleted == []
+
+
+def test_removal_stops_at_the_first_failure(add_client):
+    test_client, recorder = add_client
+    _doubled(recorder, (7, 8, 9))
+    removals = [{"employee_id": 7, "record_id": 1002}, {"employee_id": 8, "record_id": 9999},
+                {"employee_id": 9, "record_id": 1006}]
+    results = test_client.post("/api/duplicates/remove", json={"removals": removals}).get_json()["results"]
+    assert [r["ok"] for r in results] == [True, False]
+    assert recorder.deleted == [(1002, False)]         # the third was never attempted
+
+
+def test_a_delete_hris_accepts_but_doesnt_perform_is_reported(add_client):
+    test_client, recorder = add_client
+    _doubled(recorder, (7,))
+    recorder.ignore_deletes = True
+    result = test_client.post("/api/duplicates/remove",
+                              json={"removals": [{"employee_id": 7, "record_id": 1002}]}).get_json()["results"][0]
+    assert result["ok"] is False and "still in the ledger" in result["error"]
+
+
+def test_the_delete_is_a_dry_run_when_submitting_is_off(add_client, monkeypatch):
+    test_client, recorder = add_client
+    monkeypatch.setattr(app_module, "SUBMIT_ENABLED", False)
+    _doubled(recorder, (7,))
+    body = test_client.post("/api/duplicates/remove",
+                            json={"removals": [{"employee_id": 7, "record_id": 1002}]}).get_json()
+    assert body["dry_run"] is True and recorder.deleted == [(1002, True)] and len(recorder.ledger[7]) == 2
+
+
+def test_the_same_grant_worded_differently_is_still_found(add_client):
+    """Filed once before the SO number box existed, once after: the wording
+    differs, the grant doesn't. The strict submit check can't see that; the
+    finder shows both wordings and flags the difference."""
+    test_client, recorder = add_client
+    recorder._add(7, "Vacation service credits, Division Training, June 12-13, 2026 (16 hrs)", "2026-06-12", "2026-06-13", earned=3)
+    recorder._add(7, GRANT["description"], "2026-06-12", "2026-06-13", earned=3)
+    [group] = test_client.post("/api/duplicates", json={"rows": _rows(7)}).get_json()["groups"]
+    assert group["keep"]["id"] == 1001 and [d["id"] for d in group["duplicates"]] == [1002]
+    assert group["same_wording"] is False
+    assert "SO No. 1673" in group["duplicates"][0]["description"]
+    removed = test_client.post("/api/duplicates/remove", json={"removals": [{"employee_id": 7, "record_id": 1002}]})
+    assert removed.get_json()["results"][0]["ok"] is True
+
+
+def test_a_different_grant_on_other_dates_is_never_a_duplicate(add_client):
+    test_client, recorder = add_client
+    recorder._add(7, GRANT["description"], "2026-06-12", "2026-06-13", earned=3)
+    recorder._add(7, GRANT["description"], "2026-06-12", "2026-06-14", earned=3)
+    recorder._add(7, GRANT["description"], "2026-06-12", "2026-06-13", earned=3.5)
+    assert test_client.post("/api/duplicates", json={"rows": _rows(7)}).get_json()["groups"] == []
+    result = test_client.post("/api/duplicates/remove",
+                              json={"removals": [{"employee_id": 7, "record_id": 1002}]}).get_json()["results"][0]
+    assert result["ok"] is False and recorder.deleted == []
