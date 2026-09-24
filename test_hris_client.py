@@ -405,3 +405,37 @@ def test_employee_full_name():
 
 def test_known_leave_credit_type_ids():
     assert LEAVE_CREDIT_TYPE_IDS["Service Credit"] == 4
+
+
+@pytest.mark.parametrize("earned,sent", [(28.5, "28.5"), (25.944, "25.944"), (3, "3"), (100, "100"), (0.125, "0.125"), (25.943999999, "25.944")])
+def test_a_grant_is_sent_the_way_hris_sends_it(client, earned, sent):
+    """The payload HRIS's own Add Record form sent for a service credit grant
+    (captured 2026-09-24): "earned" is a string, "used" the number 0."""
+    data = client.create_leave_credit(
+        employee_id=5242, leave_credit_type_id=4, description="NMRAA MEET 2026",
+        date_from="2026-01-17", date_to="2026-03-24", earned=earned, dry_run=True,
+    )["data"]
+    assert data["earned"] == sent and isinstance(data["earned"], str)
+    assert data["used"] == 0 and not isinstance(data["used"], str)
+    assert data["wo_pay"] == 0 and data["hrisBy"] == 9999
+
+
+def test_the_captured_grant_payload_is_reproduced_exactly(client):
+    got = client.create_leave_credit(
+        employee_id=5242, leave_credit_type_id=4, description="NMRAA MEET 2026",
+        date_from="2026-01-17", date_to="2026-03-24", earned=28.5, hris_by=5845, dry_run=True,
+    )
+    assert got == {"data": {
+        "date_from": "2026-01-17T00:00:00.000Z", "date_to": "2026-03-24T09:00:00.000Z",
+        "earned": "28.5", "used": 0, "wo_pay": 0, "description": "NMRAA MEET 2026",
+        "employee": 5242, "leave_credit_type": 4, "is_published": True, "hrisBy": 5845,
+    }}
+
+
+def test_a_leave_record_keeps_its_confirmed_shape(client):
+    """Sick leave (captured 2026-09-10): "used" a string, "earned" the number 0."""
+    data = client.create_leave_credit(
+        employee_id=5192, leave_credit_type_id=4, description="Sick leave July 2, 2026",
+        date_from="2026-07-02", date_to="2026-07-02", used=1, dry_run=True,
+    )["data"]
+    assert data["used"] == "1" and data["earned"] == 0 and not isinstance(data["earned"], str)

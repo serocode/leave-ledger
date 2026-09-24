@@ -266,11 +266,11 @@ class HrisClient:
             `wo_pay` goes as a NUMBER, not a string (confirmed 2026-09-11
             against a real record moved from `used` to `wo_pay`).
           - Credits ADDED to the ledger (a vacation service credit grant) go in
-            `earned`, as a NUMBER rounded to 3 decimals. Unlike `used` and
-            `wo_pay`, a non-zero `earned` has NOT yet been confirmed against a
-            real submission — the field accepted both a string (`used`) and a
-            number (`wo_pay`) in the confirmed cases, so a number is expected
-            to work, but check the first real grant recorded in HRIS itself.
+            `earned`, rounded to 3 decimals. Confirmed 2026-09-24 against a
+            real HRIS "Add Record" of a grant: `earned` goes as a STRING
+            ("28.5"), and `used` as the NUMBER 0 — the reverse of a leave
+            record, whose `used` is a string. A zero `earned` (a leave
+            record) stays the number 0, as in the Sick leave capture.
           - `hrisBy` is REQUIRED — it's the *submitting* HRIS user's own id
             (i.e. `client.user_id` after login), not the employee the leave
             is being recorded for. This was missing entirely from the
@@ -295,12 +295,15 @@ class HrisClient:
             # time (UTC+8) on the same calendar date.
             return f"{d}T09:00:00.000Z"
 
+        is_grant = earned > 0
         payload = {
             "data": {
                 "date_from": _iso_start_of_day(date_from) if date_from else None,
                 "date_to": _iso_end_of_day(date_to) if date_to else None,
-                "earned": earned,
-                "used": str(used),
+                # "28.5", not "28.500": what HRIS's own form sends for a figure
+                # typed as 28.5.
+                "earned": f"{round(earned, 3):.3f}".rstrip("0").rstrip(".") if is_grant else earned,
+                "used": 0 if is_grant else str(used),
                 "wo_pay": wo_pay,
                 "description": description,
                 "employee": employee_id,
