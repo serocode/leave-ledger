@@ -46,7 +46,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 
 import cv2
@@ -105,6 +105,16 @@ class Form6Row:
     # What a grant was earned for, as its paragraph names it ("Aral Summer
     # Program"). Empty when the page doesn't say.
     event: str = ""
+    # Columns of this grant taken from the row above because the cell said
+    # "-do-" (or was hidden under a pen mark in a column that does): the sign
+    # that the column is a "-do-" column.
+    inherited: tuple[str, ...] = ()
+    # A grant flagged only because it grants more than the formula, every
+    # reading having agreed: not a misread, so still "the row above" that a
+    # "-do-" below it repeats.
+    trusted: bool = False
+    # The name cell as read, for re-splitting once the whole order is known.
+    name_raw: str = ""
 
     @property
     def full_name_search(self) -> str:
@@ -160,8 +170,9 @@ def _count_table_regions(img: np.ndarray) -> int:
     return sum(1 for a in areas if a >= 0.4 * areas[0] and a >= 0.01 * page)
 
 
-def _dewarp_table(img: np.ndarray) -> np.ndarray:
-    """Find the table's outer border and perspective-correct it flat."""
+def _dewarp_table(img: np.ndarray, *also: np.ndarray):
+    """Find the table's outer border and perspective-correct it flat. With
+    `also` (images the same size), returns all of them, warped identically."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     thr = _binary_threshold(gray)
     mask = _grid_mask(thr)
@@ -186,7 +197,10 @@ def _dewarp_table(img: np.ndarray) -> np.ndarray:
     src = np.array([tl, tr, br, bl], dtype=np.float32)
     dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
     matrix = cv2.getPerspectiveTransform(src, dst)
-    return cv2.warpPerspective(img, matrix, (width, height))
+    warped = cv2.warpPerspective(img, matrix, (width, height))
+    if not also:
+        return warped
+    return (warped, *(cv2.warpPerspective(a, matrix, (width, height)) for a in also))
 
 
 def _find_cell_boxes(img: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -733,7 +747,10 @@ def _parse_date_segments_numeric(raw: str) -> tuple[list[tuple[date, date]], str
     month/year). Returns ([], warning) if the text couldn't be parsed — the
     review UI should flag that row for manual entry rather than guess.
     """
-    cleaned = re.sub(r"[^0-9/\-,&]", "", raw.strip()).strip("-,")
+    # "5/6 to 6/2/2026" and "5/6 – 6/2/2026" are ranges; stripping the word or
+    # the en dash as noise glued them into "5/66/2/2026".
+    dashed = re.sub(r"\s*(?:(?<=\d)\s*to\s*(?=\d)|[–—])\s*", "-", raw.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"[^0-9/\-,&]", "", dashed).strip("-,")
     fail = ([], f"Could not parse dates from {raw!r} — enter manually.")
     if not cleaned:
         return fail
@@ -753,14 +770,17 @@ def _parse_date_segments_numeric(raw: str) -> tuple[list[tuple[date, date]], str
             return fail
         try:
             m1_str, rest1 = chunks[0].split("/", 1)
-            default_month = int(m1_str)
-            segments.append(_parse_day_token(rest1, default_month, year))
+            month = int(m1_str)
+            segments.append(_parse_day_token(rest1, month, year))
             for chunk in chunks[1:]:
                 if "/" in chunk:
                     m_str, token = chunk.split("/", 1)
-                    segments.append(_parse_day_token(token, int(m_str), year))
+                    # Days after a month change are that month's: SO 2159's
+                    # "...28,29, 6/1,2" is June 1 and 2, not June 1 and May 2.
+                    month = int(m_str)
+                    segments.append(_parse_day_token(token, month, year))
                 else:
-                    segments.append(_parse_day_token(chunk, default_month, year))
+                    segments.append(_parse_day_token(chunk, month, year))
         except (ValueError, IndexError):
             return fail
 
@@ -800,6 +820,24 @@ def _disambiguate_ampersands(raw: str) -> str:
     )
 
 
+# "28,2 9," — a day, then two single digits a space apart before a comma.
+_WRAPPED_DAY_RE = re.compile(r"\b(\d{1,2}),\s*(\d) (\d)(?=\s*,)")
+
+
+def _join_wrapped_days(raw: str) -> str:
+    """Rejoin a day number the cell's line wrap broke in two. SO 1905 lists
+    seventeen days in a narrow cell, and "...26,28,2" / "9, 2026" reads as
+    "28,2 9," — days 2 and 9, which made the period May 2-28 instead of May
+    6-29. Listed days ascend, so the halves are joined only when the parts
+    break the order and the whole continues it: "1,2 9," stays 2 and 9."""
+    def join(m: re.Match) -> str:
+        before, first, whole = int(m.group(1)), int(m.group(2)), int(m.group(2) + m.group(3))
+        if first < before < whole <= 31:
+            return f"{m.group(1)},{whole}"
+        return m.group(0)
+    return _WRAPPED_DAY_RE.sub(join, raw)
+
+
 def _parse_date_segments_monthname(
     raw: str, default_year: int | None
 ) -> tuple[list[tuple[date, date, float]], str | None]:
@@ -819,7 +857,7 @@ def _parse_date_segments_monthname(
     used) run each, an am/pm day counting as half.
     """
     fail = ([], f"Could not parse dates from {raw!r} — enter manually.")
-    raw = _disambiguate_ampersands(raw)
+    raw = _join_wrapped_days(_disambiguate_ampersands(raw))
     month: int | None = None
     pending: list[tuple[int, int, bool]] = []  # (month, day, is_half), year not yet known
     dated: list[tuple[date, bool]] = []
@@ -1205,7 +1243,10 @@ def _ocr_date_cell(img: np.ndarray, box: tuple[int, int, int, int]) -> tuple[str
     # No month name: a numeric cell, whose slashes the first whitelist can't
     # even represent ("06/17/2026" comes back "06172026"). Read it again
     # under the digits-and-slashes whitelist that style was tuned for.
-    return _ocr_cell(img, box, 6, _DATE_WHITELIST), halves
+    # A "to" between figures ("5/6 to 6/2/2026", SO 2159) is the range itself,
+    # and without it the re-read glues both dates into "5/66/2/2026".
+    allowed = _DATE_WHITELIST + ("to" if re.search(r"\d\s*to\s*\d", raw, re.IGNORECASE) else "")
+    return _ocr_cell(img, box, 6, allowed), halves
 
 
 # "DO" / "ditto" / "-do-": same as the row above. The digits-only re-read
@@ -1297,6 +1338,8 @@ def _read_numeric_dates(img: np.ndarray, box: tuple[int, int, int, int], primary
 # Work rendered during summer or Christmas vacation, weekends or holidays is
 # credited at time-and-a-half: VSC days = hours x 1.50 / 8.
 VSC_CONVERSION_FACTOR = 1.50
+# The most a confirmed reading may grant per hour (see _resolve_vsc_credits_unbounded).
+VSC_MAX_CONFIRMED_FACTOR = 2.00
 HOURS_PER_DAY = 8
 
 _NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
@@ -1306,11 +1349,91 @@ _NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 # "from May 6") or "held" ("HELD AT FR. WILLIAM F. MASTERSON ..."). A bare "on"
 # isn't enough: "Orientation on the Strengthened SHS" is part of the name. The
 # date's month isn't matched by name, since OCR misspells it ("Janauary").
-_EVENT_END_RE = re.compile(r"\s+(?:(?:on|from)\s+[A-Za-z]{3,}\.?\s*\d|held\b)", re.IGNORECASE)
+# A month's name or abbreviation, as a whole word: what lets a period open with
+# no "on"/"from" — SO 2159's "...PROGRAMS (SRP) May 6 to June 2, 2026."
+_MONTH_WORD = r"(?:" + "|".join(sorted({*MONTH_NAMES[1:], *(m[:3] for m in MONTH_NAMES[1:])}, key=len, reverse=True)) + r")\b"
+
+_EVENT_END_RE = re.compile(
+    r"\s+(?:(?:on|from)\s+[A-Za-z]{3,}\.?\s*\d|held\b|" + _MONTH_WORD + r"\.?\s*\d{1,2}\b)", re.IGNORECASE,
+)
 # "during", including OCR'd remnants of it: Pedro Roa's came back "duri : 3 uring".
 _EVENT_START_RE = re.compile(r"\b(?:d?uring)\s+", re.IGNORECASE)
 _EVENT_FILLER_RE = re.compile(r"^(?:(?:the|participation\s+in|conduct\s+of)\s+)+", re.IGNORECASE)
 _EVENT_SMALL_WORDS = {"A", "AN", "AND", "AT", "BY", "CUM", "FOR", "IN", "OF", "ON", "OR", "THE", "TO", "WITH"}
+
+
+# "on JUNE 12-13. 2026", "from June 1-5, 2026", "on May 4 to 29, 2026",
+# "from May 6 to June 2, 2026": the period a special order grants credits for.
+_PERIOD_RE = re.compile(
+    r"(?:\b(?:on|from)\s+|(?<![A-Za-z])(?=" + _MONTH_WORD + r"))(?P<m1>[A-Za-z]{3,10})\.?\s*(?P<d1>\d{1,2})\b"
+    r"(?:\s*(?:-|\u2013|to)\s*(?:(?P<m2>[A-Za-z]{3,10})\.?\s*)?(?P<d2>\d{1,2})\b)?"
+    r"[,.\s]*(?P<y>20\d\d)?",
+    re.IGNORECASE,
+)
+
+
+def _month_number(word: str) -> int | None:
+    prefix = word[:3].lower()
+    return next((i for i, name in enumerate(MONTH_NAMES) if i and name[:3].lower() == prefix), None)
+
+
+def _grant_sentence(flat: str) -> re.Match | None:
+    """Where the order's grant sentence starts: "rendered" ("...for services
+    rendered during..."), or failing that, "service credits". "rendered" first:
+    SO 2159's title, "SPECIAL ORDER FOR VACATION SERVICE CREDITS", comes before
+    the order's date line, which then read as the period (July 7)."""
+    return re.search(r"rendered", flat, re.IGNORECASE) or re.search(r"service\s+credits?", flat, re.IGNORECASE)
+
+
+def _period_from_text(text: str, default_year: int | None) -> tuple[str, str] | None:
+    """The period the order's paragraph says the credits are for, as ISO
+    dates — or None when it isn't stated cleanly. Only ever used to *doubt* a
+    row, so a paragraph that doesn't parse costs nothing."""
+    flat = " ".join(re.sub(r"-\s*\n\s*", "", text).split())
+    anchor = _grant_sentence(flat)
+    if not anchor:
+        return None
+    for m in _PERIOD_RE.finditer(flat[anchor.end():anchor.end() + 500]):
+        month1 = _month_number(m.group("m1"))
+        if not month1:
+            continue        # "on THE STRENGTHENED..." isn't a date
+        month2 = _month_number(m.group("m2")) if m.group("m2") else month1
+        year = int(m.group("y")) if m.group("y") else default_year
+        if not month2 or not year:
+            return None
+        try:
+            start = date(year, month1, int(m.group("d1")))
+            end = date(year, month2, int(m.group("d2") or m.group("d1")))
+        except ValueError:
+            return None
+        return (start.isoformat(), end.isoformat()) if start <= end else None
+    return None
+
+
+def _apply_period(rows: list[Form6Row], period: tuple[str, str] | None) -> None:
+    """Doubt a grant whose dates fall outside the period its order states.
+
+    SO 1892 read a 5 as a 9 in "June 1,2,3,4,5" on four rows (June 1-9), and a
+    pen stroke turned another into June 1-25 — plausible ranges, quietly wrong;
+    the order says June 1-5. The dates stay, since the doubt may be the
+    paragraph's (one order's rows run a day past its printed period), but the
+    row is flagged and unticked: it can't be submitted without a deliberate
+    tick. If a good share of the page is "outside", it is the paragraph that
+    was misread, not every row — and nothing is touched."""
+    grants = [r for r in rows if r.kind == "vsc" and r.date_from and r.date_to]
+    if not period or not grants:
+        return
+    lo, hi = period
+    outside = [r for r in grants if not (lo <= r.date_from and r.date_to <= hi)]
+    if not outside or len(outside) > 0.4 * len(grants):
+        return
+    for r in outside:
+        note = (
+            f"Dates read as {_format_period(r.date_from, r.date_to)}, outside the order's period "
+            f"({_format_period(lo, hi)}) — check them against the paper before ticking."
+        )
+        r.parse_warning = f"{r.parse_warning} {note}" if r.parse_warning else note
+        r.in_scope = False
 
 
 def _event_from_text(text: str) -> str:
@@ -1319,7 +1442,7 @@ def _event_from_text(text: str) -> str:
     SENIOR HIGH SCHOOL CURRICULUM on JUNE 12-13, 2026". Empty when the page
     has no such sentence (a continuation page) or it didn't OCR cleanly."""
     flat = " ".join(re.sub(r"-\s*\n\s*", "", text).split())   # rejoin "ser-\nvice"
-    anchor = re.search(r"rendered|service\s+credits?", flat, re.IGNORECASE)
+    anchor = _grant_sentence(flat)
     if not anchor:
         return ""
     tail = flat[anchor.end():anchor.end() + 400]
@@ -1330,9 +1453,14 @@ def _event_from_text(text: str) -> str:
     if not starts:
         return ""
     event = _EVENT_FILLER_RE.sub("", tail[starts[-1].end():end.start()]).strip(" .,;:")
-    if not 3 <= len(event) <= 200:
+    if not 3 <= len(event) <= 200 or _TABLE_HEADER_TEXT_RE.search(event):
+        # SO 1849's page 6 OCR'd its paragraph out of order, and what ran on
+        # from "during" was the table's header and first row.
         return ""
     return _event_case(event)
+
+
+_TABLE_HEADER_TEXT_RE = re.compile(r"\bNo\.\s*of\b|\bInclusive\b|\bName\s+Position\b|\bCredits\s+Granted\b", re.IGNORECASE)
 
 
 def _event_case(event: str) -> str:
@@ -1447,6 +1575,12 @@ def _normalize_credits(raw: str) -> float | None:
     return float(m.group(0)) if m else None
 
 
+def _blank_text(raw: str) -> bool:
+    """Nothing legible: empty, or only marks ("-", "--", ","). What a cell of
+    "-do-" reads as when a pen line runs through it."""
+    return not re.search(r"[A-Za-z0-9]", raw)
+
+
 def vsc_days(hours: float, factor: float = VSC_CONVERSION_FACTOR) -> float:
     """VSC days = hours x factor / 8, to the 3 decimals the ledger keeps."""
     return round(hours * factor / HOURS_PER_DAY, 3)
@@ -1457,13 +1591,13 @@ MAX_VSC_DAYS_PER_CALENDAR_DAY = 24 * VSC_CONVERSION_FACTOR / HOURS_PER_DAY
 
 
 def _resolve_vsc_credits(
-    hours: float | None, printed: float | None, period_days: int | None = None,
+    hours: float | None, printed: float | None, period_days: int | None = None, confirmed: bool = False,
 ) -> tuple[float | None, str | None]:
     """_resolve_vsc_credits_unbounded, then refused outright if the result is
     more than the period could physically earn. A lost decimal point turns
     7.21 into 721 — a figure that flagging alone would still leave prefilled
     and ticked for submission."""
-    earned, warning = _resolve_vsc_credits_unbounded(hours, printed)
+    earned, warning = _resolve_vsc_credits_unbounded(hours, printed, confirmed)
     if earned is not None and period_days:
         ceiling = period_days * MAX_VSC_DAYS_PER_CALENDAR_DAY
         if earned > ceiling:
@@ -1474,7 +1608,9 @@ def _resolve_vsc_credits(
     return earned, warning
 
 
-def _resolve_vsc_credits_unbounded(hours: float | None, printed: float | None) -> tuple[float | None, str | None]:
+def _resolve_vsc_credits_unbounded(
+    hours: float | None, printed: float | None, confirmed: bool = False,
+) -> tuple[float | None, str | None]:
     """The credit to record for one row, and a warning when it needs a look.
 
     The printed figure is what the special order grants, so it is what gets
@@ -1487,7 +1623,13 @@ def _resolve_vsc_credits_unbounded(hours: float | None, printed: float | None) -
     hours can earn at x1.50 — while OCR misreads push the other way (a 5 read
     as a 9, a lost decimal point). So the hours are an upper bound, not a
     target. Downward misreads are caught separately, by reading the cell more
-    than one way (_consensus_credits)."""
+    than one way (_consensus_credits).
+
+    Except that some orders do grant more. SO 2159 prints 28.5 for 114 hours
+    on seven rows (x2.00) and 27.188 for 112. So a figure above the hours'
+    ceiling that every independent reading agrees on (`confirmed`) is filled
+    in as printed — but with a warning, and the caller leaves it unticked.
+    Up to x2.00 only: a lost decimal point is ten times over, not a third."""
     if printed is None:
         ceiling = f" (at most {vsc_days(hours):g} for {hours:g} hours at x{VSC_CONVERSION_FACTOR:.2f})" if hours is not None else ""
         # Not computed and filled in: the formula is exactly what these
@@ -1498,6 +1640,12 @@ def _resolve_vsc_credits_unbounded(hours: float | None, printed: float | None) -
     # The rounded hourly rate (0.188) sits a hair above the exact one (0.1875)
     # and is used in practice, so it is the ceiling.
     ceiling = hours * round(VSC_CONVERSION_FACTOR / HOURS_PER_DAY, 3) + 0.0015
+    if printed > ceiling and confirmed and printed <= vsc_days(hours, VSC_MAX_CONFIRMED_FACTOR) + 0.0015:
+        return printed, (
+            f"Credits printed as {printed:g} — more than {hours:g} hours earn at x{VSC_CONVERSION_FACTOR:.2f} "
+            f"({vsc_days(hours):g}). Read alike two independent ways, so it's filled in as printed, but not ticked: "
+            "confirm the paper grants it before submitting."
+        )
     if printed > ceiling:
         # Not filled in, even flagged: no office can grant more than the hours
         # earn, so this is a misread — and a prefilled misread stays ticked.
@@ -1506,6 +1654,24 @@ def _resolve_vsc_credits_unbounded(hours: float | None, printed: float | None) -
             f"x{VSC_CONVERSION_FACTOR:.2f} ({vsc_days(hours):g}). Likely a misread; enter it from the paper."
         )
     return printed, None
+
+
+def _earned_at_formula(hours: float | None, credits: float | None) -> bool:
+    """Whether `credits` is exactly what `hours` earn, at the exact rate or the
+    rounded one (0.188) some offices use."""
+    if hours is None or credits is None:
+        return False
+    rates = (VSC_CONVERSION_FACTOR / HOURS_PER_DAY, round(VSC_CONVERSION_FACTOR / HOURS_PER_DAY, 3))
+    return any(abs(credits - hours * rate) < 0.0015 for rate in rates)
+
+
+def _earns_as_printed(hours: float, credits: float) -> bool:
+    """Whether `credits` is what `hours` earn at the formula, to the precision
+    it's printed at: 14.06 for 75 hours' 14.0625, as well as the exact rates
+    _earned_at_formula checks."""
+    decimals = len(f"{credits:g}".partition(".")[2])
+    exact = hours * VSC_CONVERSION_FACTOR / HOURS_PER_DAY
+    return _earned_at_formula(hours, credits) or (decimals >= 2 and abs(round(exact, decimals) - credits) < 1e-9)
 
 
 def vsc_ceiling(hours: float | None) -> float | None:
@@ -1546,6 +1712,61 @@ def _consensus_credits(reads: list[str], ceiling: float | None = None) -> tuple[
     return None, f"OCR disagreed on the credits granted ({options}) — enter it from the paper.{hint}"
 
 
+def _agreed(reads: list[str], parse) -> float | None:
+    """The value both scaled reads give, or None if they don't agree. Never
+    zero: under a digits-only whitelist "-do-" reads as "0", and no grant
+    is for nothing."""
+    values = [parse(r) for r in reads]
+    return values[0] if len(values) == 2 and values[0] and values[0] == values[1] else None
+
+
+def _settle_credits(
+    old: list[float | None], printed: float | None, warning: str | None,
+    scaled: float | None, ceiling: float | None,
+) -> tuple[float | None, str | None]:
+    """Weigh the scaled reads (_scaled_reads) against the whole-cell reads.
+
+    The scaled value is taken where the whole-cell reads offer nothing the
+    hours allow — SO 1849's "9.2902" and "9.292" for a 5.252 earned by 28
+    hours — or agree with it. Where a whole-cell read the hours allow says
+    something else, two believable figures disagree and neither is filled
+    in: SO 1849's Morata read as 5.202 whole and 5.252 scaled, both under
+    28 hours' ceiling, and only the paper can say."""
+    if scaled is None or (ceiling is not None and scaled > ceiling):
+        return printed, warning
+    believable = {v for v in old if v is not None and (ceiling is None or v <= ceiling)}
+    if believable <= {scaled} or printed == scaled:
+        return scaled, None
+    options = " or ".join(f"{v:g}" for v in [scaled, *sorted(believable - {scaled})])
+    return None, f"OCR disagreed on the credits granted ({options}) — enter it from the paper."
+
+
+def _most_hours(period: tuple[str, str] | None) -> float | None:
+    """Every hour of the order's stated period: no teacher serves more."""
+    if not period:
+        return None
+    return 24 * ((date.fromisoformat(period[1]) - date.fromisoformat(period[0])).days + 1)
+
+
+def _settle_hours(
+    hours: float | None, digit_reads: tuple[float | None, ...], scaled: float | None, most: float | None,
+) -> tuple[float | None, str | None]:
+    """The hours, weighing the scaled reads against the whole-cell ones, and
+    the readings that disagreed if they can't be settled ("90.97 or 50.97").
+
+    The scaled value is taken where the whole-cell reads found nothing, or
+    more hours than the order's period has — SO 1849's "395" for 35 in a
+    five-day order — or where one of them read it too. Otherwise two
+    believable figures disagree, and the row isn't ticked: SO 1896's 50.97
+    read whole as 90.97, ticked, and "(90.97 hrs)" would have gone to HRIS."""
+    possible = lambda v: v is not None and (most is None or v <= most)
+    if not possible(scaled) or scaled == hours:
+        return hours, None
+    if not possible(hours) or scaled in digit_reads:
+        return scaled, None
+    return None, f"{hours:g} or {scaled:g}"
+
+
 def _period_from_dates(raw: str, default_year: int | None) -> tuple[str | None, str | None, str | None]:
     """A grant's Inclusive Dates is one period ("May 6 to June 2, 2026"), not
     a list of absence days — the first and last dates mentioned bound it."""
@@ -1565,19 +1786,79 @@ def _period_from_dates(raw: str, default_year: int | None) -> tuple[str | None, 
         runs, warning = _parse_date_segments_monthname(raw, default_year)
         dates = [d for f, t, _ in runs for d in (f, t)]
     else:
-        segments, warning = _parse_date_segments_numeric(raw)
+        segments, warning = _parse_date_segments_numeric(_yearless_day_list(raw, default_year))
         dates = [d for f, t in segments for d in (f, t)]
     if not dates:
         return None, None, warning or f"Could not parse dates from {raw!r} — enter manually."
     return min(dates).isoformat(), max(dates).isoformat(), None
 
 
+# "296/1": a day and the next month's number with the space between lost.
+_LOST_SPACE_BEFORE_MONTH_RE = re.compile(r"(?<![\d/])(\d{2})(\d{1,2})/")
+
+
+def _yearless_day_list(raw: str, default_year: int | None) -> str:
+    """A numeric day list as _parse_date_segments_numeric reads it.
+
+    SO 2159 lists the days worked by month with no year at all — "5/6-8,11-15,
+    18-22,25,26,28,29, 6/1,2" — the year is in the order's paragraph. That
+    year goes on the end. And where the cell's space before the next month
+    was lost ("...28,296/1,2"), the run of digits is split back into the day
+    and the month — only when it can't be a month itself."""
+    def split(m: re.Match) -> str:
+        day, month = int(m.group(1)), int(m.group(2))
+        return f"{m.group(1)},{m.group(2)}/" if 1 <= day <= 31 and 1 <= month <= 12 else m.group(0)
+
+    text = _LOST_SPACE_BEFORE_MONTH_RE.sub(split, raw)
+    if default_year and "/" in text and not re.search(r"(?:19|20)\d{2}", text):
+        text = f"{text.rstrip(' ,')}/{default_year}"
+    return text
+
+
+def _choose_dates(
+    first: str, second: str, default_year: int | None, period: tuple[str, str] | None,
+) -> tuple[str, str | None, str | None, str | None]:
+    """(raw text, date_from, date_to, warning) from two independent reads of a
+    month-name date cell. The reads fail in different places — SO 1892's
+    "June 1,2,3,4,5, 2026" came back "...4,9," on one pass and "...4,5," on the
+    other, and "...5,42026" on one where the other was clean.
+
+    Both agree: fine. Only one parses: take it. Both parse but differ: take the
+    one inside the order's period if only one is, since a 5 misread as 9 lands
+    outside it; failing that, take the first and say the reads disagreed."""
+    a_from, a_to, a_warn = _period_from_dates(first, default_year)
+    if not second.strip() or second.strip() == first.strip():
+        return first, a_from, a_to, a_warn
+    b_from, b_to, b_warn = _period_from_dates(second, default_year)
+    if a_from and b_from:
+        if (a_from, a_to) == (b_from, b_to):
+            return first, a_from, a_to, a_warn
+        inside = lambda f, t: period is None or (period[0] <= f and t <= period[1])
+        a_in, b_in = inside(a_from, a_to), inside(b_from, b_to)
+        if a_in and not b_in:
+            return first, a_from, a_to, a_warn
+        if b_in and not a_in:
+            return second, b_from, b_to, b_warn
+        return first, a_from, a_to, (
+            f"OCR disagreed on the dates ({_format_period(a_from, a_to)} or {_format_period(b_from, b_to)}) "
+            "— check them against the paper."
+        )
+    if b_from:
+        return second, b_from, b_to, b_warn
+    return first, a_from, a_to, a_warn
+
+
 def _extract_vsc_row(
     img: np.ndarray, cells: dict[str, list[tuple[str, tuple[int, int, int, int]]]],
     default_year: int | None, seq: int, previous: Form6Row | None = None, event: str = "",
+    period: tuple[str, str] | None = None, inked: np.ndarray | None = None,
 ) -> list[Form6Row]:
     """previous: the grant row above, for "-do-" cells to inherit from.
-    event: what the page's paragraph says the grants were earned for."""
+    inked: the table as scanned, pen and all (img has blue pen removed). A
+    "-do-" hidden under a pen mark is told by the mark, so it is looked for
+    there; whether digits can be read through it is a question for img.
+    event: what the page's paragraph says the grants were earned for.
+    period: the period it states, to tell a misread date from a real one."""
     def read_all(field: str, psm: int, whitelist: str | None) -> str:
         # A pen tick or margin line through a column can split one cell into
         # two boxes; reading them left to right keeps the whole value.
@@ -1585,22 +1866,39 @@ def _extract_vsc_row(
             _ocr_cell(img, box, psm, whitelist).strip() for _, box in cells.get(field) or []
         ).strip()
 
-    last_name, first_name, middle_initial = _split_any_name(read_all("name", 6, None))
+    name_raw = read_all("name", 6, None)
+    last_name, first_name, middle_initial = _split_any_name(name_raw)
     if not last_name or not first_name:
         return []
 
     ditto_notes = []
     # psm 6: "31 HOURS & 37 MINUTES" wraps over three lines in its cell.
     hours_raw = read_all("hours", 6, None)
-    if img is not None and _has_pen_stroke(img, [box for _, box in cells.get("hours") or []]):
+    inherited: list[str] = []
+    hidden = False      # a figure taken from the row above without seeing it
+    hours_disputed = False
+    hour_options: list[float] = []
+    is_ditto_column = lambda name: bool(previous and name in previous.inherited)
+    inked = img if inked is None else inked
+    hours_stroke = img is not None and _has_pen_stroke(img, [box for _, box in cells.get("hours") or []])
+    hours_marked = inked is not None and _has_pen_stroke(inked, [box for _, box in cells.get("hours") or []])
+    if _DITTO_RE.match(hours_raw):
+        hours = previous.hours if previous else None
+        inherited.append("hours")
+        if hours is None:
+            ditto_notes.append("Hours are \"-do-\" but the row above had none to repeat — enter them from the paper.")
+    elif previous and previous.hours is not None and is_ditto_column("hours") and (hours_marked or _blank_text(hours_raw)):
+        # A "-do-" column, and this cell is hidden: a pen mark reads as "-",
+        # nothing, or stray digits ("4"). Taken from above, but never quietly.
+        hours = previous.hours
+        inherited.append("hours")
+        hidden = True
+        ditto_notes.append("Hours are hidden by a pen mark; taken from the row above (\"-do-\") — check them against the paper.")
+    elif hours_stroke:
         # Left unread, not guessed: the credits (a separate cell) are still
         # taken as printed, and no invented "(1 hrs)" reaches the description.
         hours = None
         ditto_notes.append("A pen mark crosses the hours cell, so hours weren't read — check them against the paper.")
-    elif _DITTO_RE.match(hours_raw):
-        hours = previous.hours if previous else None
-        if hours is None:
-            ditto_notes.append("Hours are \"-do-\" but the row above had none to repeat — enter them from the paper.")
     else:
         hours = _normalize_hours(hours_raw)
         if not re.search(r"[HM]", hours_raw.upper()):
@@ -1614,22 +1912,118 @@ def _extract_vsc_row(
             digit_reads = (_normalize_hours(first), _normalize_hours(second))
             if digit_reads[0] is not None and digit_reads[0] == digit_reads[1] != hours:
                 hours = digit_reads[0]
+            # A letter that is no digit's look-alike means the free-text read
+            # isn't a reading of these digits: SO 2159's "75" came back "T9",
+            # and 9 hours stood because the two digit reads (79, 75) differed.
+            stray = re.sub(r"[^A-Z]|[SOQ" + re.escape("".join(_ONE_LOOKALIKES).upper()) + "]", "", hours_raw.upper())
+            # Not in a "-do-" column, where stray marks are the pen over a "-do-"
+            # and the row above is what settles it (further down).
+            stray = stray and not is_ditto_column("hours")
+            if stray and digit_reads[0] != digit_reads[1]:
+                hours = None
+            hour_boxes = [box for _, box in cells.get("hours") or []]
+            scaled = _agreed(_scaled_reads(img, hour_boxes, "0123456789."), _normalize_hours)
+            thick = _normalize_hours(_thick_read(img, hour_boxes, "0123456789."))
+            if scaled is not None and thick == scaled and (_most_hours(period) is None or scaled <= _most_hours(period)):
+                # Two ways of reading it apart from the whole-cell reads agree.
+                hours, disputed = scaled, None
+            else:
+                hours, disputed = _settle_hours(hours, digit_reads, scaled, _most_hours(period))
+            if hours is None and not disputed and stray:
+                options = sorted({v for v in digit_reads if v is not None})
+                if len(options) > 1:
+                    disputed = " or ".join(f"{v:g}" for v in options)
+            if disputed:
+                hours_disputed = True
+                hour_options = [float(v) for v in re.findall(r"\d+(?:\.\d+)?", disputed)]
+                ditto_notes.append(f"OCR disagreed on the hours served ({disputed}) — check them against the paper.")
     credit_boxes = [box for _, box in cells.get("credits") or []]
+    credits_confirmed = False   # read alike by every independent way of reading it
+    credits_doubt = False       # ...but the whole-cell reads all said otherwise
     credit_wl = "0123456789.,"
     # Read once without the digits whitelist first: under it "-do-" comes
     # back as "0", which would be filled in as zero credits.
-    if credit_boxes and _DITTO_RE.match(read_all("credits", 7, None)):
+    credits_text = read_all("credits", 7, None) if credit_boxes else ""
+    credits_stroke = img is not None and credit_boxes and _has_pen_stroke(img, credit_boxes)
+    credits_marked = inked is not None and credit_boxes and _has_pen_stroke(inked, credit_boxes)
+    if credit_boxes and _DITTO_RE.match(credits_text):
         printed, credits_warning = None, None
+        inherited.append("credits")
         if previous and previous.earned:
             printed = float(previous.earned)
         else:
             ditto_notes.append("Credits are \"-do-\" but the row above had none to repeat — enter them from the paper.")
+    elif credit_boxes and previous and previous.earned and is_ditto_column("credits") and (credits_marked or _blank_text(credits_text)):
+        printed, credits_warning = float(previous.earned), None
+        inherited.append("credits")
+        hidden = True
+        ditto_notes.append("Credits are hidden by a pen mark; taken from the row above (\"-do-\") — check them against the paper.")
     else:
-        printed, credits_warning = _consensus_credits([
-            " ".join(_ocr_cell(img, b, 7, credit_wl) for b in credit_boxes),
-            " ".join(_ocr_cell(img, b, 6, credit_wl) for b in credit_boxes),
-            " ".join(_ocr_cell_plain(img, b, 7, credit_wl) for b in credit_boxes),
-        ], vsc_ceiling(hours))
+        glyphs = [_glyph_count(img, b) for b in credit_boxes] if img is not None else []
+        if sum(glyphs) == 1:
+            # One digit ("5"): read cropped to it. Whole-cell reads miss it or
+            # guess, and psm 8 over the whole cell read SO 1905's 5s as 8s.
+            reads = _lone_digit_reads(img, credit_boxes[glyphs.index(1)])
+        else:
+            reads = [
+                " ".join(_ocr_cell(img, b, 7, credit_wl) for b in credit_boxes),
+                " ".join(_ocr_cell(img, b, 6, credit_wl) for b in credit_boxes),
+                " ".join(_ocr_cell_plain(img, b, 7, credit_wl) for b in credit_boxes),
+            ]
+        printed, credits_warning = _consensus_credits(reads, vsc_ceiling(hours))
+        if sum(glyphs) != 1:
+            scaled = _agreed(_scaled_reads(img, credit_boxes, credit_wl), _normalize_credits)
+            thick = _normalize_credits(_thick_read(img, credit_boxes, credit_wl))
+            whole = {_normalize_credits(r) for r in reads} - {None}
+            if scaled is not None and thick == scaled:
+                # Two ways of reading it apart from the whole-cell reads agree:
+                # SO 2159's "28.5" read whole as 28.9, 28.9, 28.5. Taken as
+                # printed, even above what the hours earn at x1.50 (see
+                # _resolve_vsc_credits).
+                printed, credits_warning, credits_confirmed = scaled, None, True
+                if len(whole) == 1 and scaled not in whole and next(iter(whole)) <= (vsc_ceiling(hours) or float("inf")):
+                    # Every whole-cell read says something else. That is how
+                    # this font's 5 misreads (its "28.5" under a signature read
+                    # 28.9 three times), but it's three reads against three:
+                    # filled in, not ticked. Unless the hours rule it out.
+                    (other,) = whole
+                    credits_doubt = True
+                    credits_warning = (
+                        f"Credits read as {scaled:g} close up and {other:g} across the whole cell — "
+                        f"{scaled:g} is filled in; check it against the paper."
+                    )
+            else:
+                printed, credits_warning = _settle_credits(
+                    [_normalize_credits(r) for r in reads], printed, credits_warning, scaled, vsc_ceiling(hours))
+        if credits_stroke and not _earned_at_formula(hours, printed):
+            # As with the hours: digits under a pen stroke aren't a reading.
+            # SO 1898's Gabitano: a "6" crossed by the signature read as "2" on
+            # all three passes, and 2 fits under what the hours can earn. Only
+            # the hours earning exactly the figure vouch for it — Pedro Roa's
+            # signature runs down the credits column beside a clean "22.56"
+            # for 120 hours — since no misread lands on that by chance.
+            printed = None
+            credits_warning = "A pen mark crosses the credits cell, so the credits weren't read — enter them from the paper."
+    if hours_disputed and printed is not None and not hidden:
+        # The credits settle it when exactly one of the readings earns them at
+        # the formula: SO 2159's "75" read as 75 or 79, and 14.06 is 75 hours'
+        # 14.0625 to the cent. A misread doesn't land on that by chance.
+        earning = [h for h in hour_options if _earns_as_printed(h, printed)]
+        if len(earning) == 1:
+            hours, hours_disputed = earning[0], False
+            ditto_notes = [n for n in ditto_notes if not n.startswith("OCR disagreed on the hours served")]
+    ceiling_now = vsc_ceiling(hours)
+    if (printed is not None and ceiling_now is not None and printed > ceiling_now and is_ditto_column("hours")
+            and previous and previous.hours is not None and previous.earned
+            and abs(printed - float(previous.earned)) < 1e-9 and (vsc_ceiling(previous.hours) or 0) >= printed):
+        # The credits are the row above's ("-do-") and the hours are not, in a
+        # column of "-do-": a pen mark turned this row's "-do-" into stray
+        # digits ("4"), and 6 credits can't come from 4 hours. The hours are
+        # the misread, not the credits.
+        hours = previous.hours
+        inherited.append("hours")
+        hidden = True
+        ditto_notes.append("Hours were misread under a pen mark; taken from the row above (\"-do-\") — check them against the paper.")
     if hours is None and printed is None and not credits_warning and not ditto_notes:
         # No figures at all: a header remnant or a note row, not a grant.
         return []
@@ -1640,27 +2034,53 @@ def _extract_vsc_row(
     if previous and previous.dates_raw and _DITTO_RE.match(dates_raw):
         # Carried down as the text itself, so a run of "DO"s chains.
         dates_raw = previous.dates_raw
-    date_from, date_to, date_warning = _period_from_dates(dates_raw, default_year)
+        inherited.append("dates")
+    elif (previous and previous.dates_raw and cells.get("dates") and is_ditto_column("dates")
+          and not _MONTH_IN_TEXT_RE.search(dates_raw)
+          and (_blank_text(dates_raw) or _has_pen_stroke(inked, [box for _, box in cells["dates"]]))):
+        dates_raw = previous.dates_raw
+        inherited.append("dates")
+        hidden = True
+        ditto_notes.append("Dates are hidden by a pen mark; taken from the row above (\"-do-\") — check them against the paper.")
+    if cells.get("dates") and _MONTH_IN_TEXT_RE.search(dates_raw) and not (previous and dates_raw == previous.dates_raw):
+        second = _ocr_cell_plain(img, cells["dates"][0][1], 6, _ABSENCE_DATES_WHITELIST)
+        dates_raw, date_from, date_to, date_warning = _choose_dates(dates_raw, second, default_year, period)
+    else:
+        date_from, date_to, date_warning = _period_from_dates(dates_raw, default_year)
     period_days = (
         (date.fromisoformat(date_to) - date.fromisoformat(date_from)).days + 1 if date_from else None
     )
-    earned, warning = _resolve_vsc_credits(hours, printed, period_days)
+    earned, warning = _resolve_vsc_credits(hours, printed, period_days, confirmed=credits_confirmed)
+    # Granted above what the hours earn at x1.50, and filled in only because
+    # every reading agreed: shown, but never ticked without a look.
+    above_formula = earned is not None and hours is not None and earned > vsc_ceiling(hours)
     if credits_warning:
-        warning = credits_warning if earned is None or not warning else f"{credits_warning} {warning}"
+        warning = credits_warning if earned is None and not credits_doubt or not warning else f"{credits_warning} {warning}"
 
     row_no = _normalize_digits(read_all("no", 7, None))
     if not row_no.isdigit():
         row_no = str(seq)
 
-    description = _vsc_description(event, date_from, date_to, hours)
+    # Credits refused as more than the hours can earn: the hours are as likely
+    # the misread ("1" for "71"), and a wrong "(1 hrs)" would go to HRIS.
+    described_hours = None if (printed is not None and earned is None) else hours
+    description = _vsc_description(event, date_from, date_to, described_hours)
+    position_text = read_all("position", 6, None)
+    position_raw = previous.position_raw if previous and _DITTO_RE.match(position_text) else _normalize_position(position_text)
+    position_boxes = [box for _, box in cells.get("position") or []]
+    if img is not None and len(position_boxes) == 1 and _STEMMED_POSITION_RE.match(position_text.upper().replace(" ", "")):
+        stems = _count_stems(img, position_boxes[0])
+        if stems is not None and 2 <= stems <= 4:
+            position_raw = "T-" + "I" * (stems - 1)
 
     return [Form6Row(
         row_no=row_no,
         last_name=last_name,
         first_name=first_name,
         middle_initial=middle_initial,
-        # psm 6: a grant form wraps "TEACHER / III" onto two lines.
-        position_raw=_normalize_position(read_all("position", 6, None)),
+        # psm 6: a grant form wraps "TEACHER / III" onto two lines. "-do-"
+        # repeats the row above.
+        position_raw=position_raw,
         dates_raw=dates_raw,
         days_raw="",
         leave_type="VSC",
@@ -1673,18 +2093,26 @@ def _extract_vsc_row(
         # Ticked for submission only when something corroborates the figure:
         # the hours it was checked against, or at least a period that bounded
         # it. A lone number read off a scan with neither isn't pre-ticked.
-        in_scope=earned is not None and (hours is not None or period_days is not None),
+        # A row with no dates can't be submitted, and one whose figures were
+        # taken from above without being seen must be confirmed, not ticked.
+        in_scope=(earned is not None and date_from is not None and not hidden and not hours_disputed
+                  and not above_formula and not credits_doubt
+                  and (hours is not None or period_days is not None)),
         kind="vsc",
         hours=hours,
         earned=_format_used(earned) if earned is not None else "",
         event=event,
+        inherited=tuple(inherited),
+        trusted=above_formula and not (date_warning or ditto_notes or credits_warning),
+        name_raw=name_raw,
     )]
 
 
 def _extract_mapped_row(
     img: np.ndarray, row_boxes: list[tuple[int, int, int, int]],
     labels: list[str | None], default_year: int | None, seq: int,
-    previous: Form6Row | None = None, event: str = "",
+    previous: Form6Row | None = None, event: str = "", period: tuple[str, str] | None = None,
+    inked: np.ndarray | None = None,
 ) -> list[Form6Row]:
     """Read one data row using the header's own column labels, whatever order
     the school chose to print them in."""
@@ -1694,7 +2122,7 @@ def _extract_mapped_row(
             cells.setdefault(label, []).append(("", box))
 
     if cells.get("hours") or cells.get("credits"):
-        return _extract_vsc_row(img, cells, default_year, seq, previous, event)
+        return _extract_vsc_row(img, cells, default_year, seq, previous, event, period, inked)
 
     def read(field: str, psm: int, whitelist: str | None, index: int = 0) -> str:
         entries = cells.get(field) or []
@@ -2157,6 +2585,24 @@ def _column_grid(grouped: list[list[Box]], min_rows: int = 3) -> list[tuple[int,
     return grid
 
 
+def _sits_on_grid(row: list[Box], grid: list[tuple[int, int]]) -> bool:
+    """Whether a row's cells stand on the table's column rules — at least half
+    of them starting or ending where a column does. SO 1898 page 1: the
+    signer's pen line joins the table to the page footer's "Doc. Ref. Code |
+    Rev" box, so that box lands inside the table; its five cells match none of
+    the table's columns, and filled out to the grid they read as a teacher. A
+    cell split by a pen stroke keeps one edge on a rule, and a cell spanning
+    several columns keeps both."""
+    tolerance = max(8, 0.01 * (grid[-1][1] - grid[0][0]))
+    lefts = [left for left, _ in grid]
+    rights = [right for _, right in grid]
+    on_rule = sum(
+        min(abs(x - l) for l in lefts) <= tolerance or min(abs(x + w - r) for r in rights) <= tolerance
+        for x, _, w, _ in row
+    )
+    return 2 * on_rule >= len(row)
+
+
 def _fill_row_to_grid(row: list[Box], grid: list[tuple[int, int]]) -> list[Box]:
     """Put back any cell a short row lost, cut from its column's x-range and
     the row's own height. Rows that already have every column — or more,
@@ -2221,6 +2667,247 @@ def _has_text(img: np.ndarray, box: Box, min_percent: float = 1.0) -> bool:
 # 1.0); a blank pre-printed row's total is 0.0.
 _MIN_FIGURES_INK_PERCENT = 0.8
 
+
+def _cell_marks(img: np.ndarray, box: Box, pad: int = 6) -> tuple[np.ndarray, np.ndarray] | None:
+    """A cell's ink with its rules removed, and the stats of each mark in it
+    (cv2.connectedComponentsWithStats, background dropped)."""
+    x, y, w, h = box
+    crop = img[y + pad : y + h - pad, x + pad : x + w - pad]
+    if crop.size == 0:
+        return None
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    dark = (gray < np.median(gray) - 60).astype(np.uint8)
+    ch, cw = dark.shape
+    lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, cw // 3), 1)))
+    lines |= cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(1, int(ch * 0.8)))))
+    ink = dark & (1 - lines)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    return ink, stats[1:]
+
+
+def _glyph_count(img: np.ndarray, box: Box, pad: int = 6) -> int:
+    """How many digit-sized marks a cell holds (rules removed). A cell of one
+    lone digit ("5") has one; "6.299" has several, even under a pen stroke."""
+    marks = _cell_marks(img, box, pad)
+    if marks is None:
+        return 0
+    ink, stats = marks
+    return len(_digit_sized(stats, ink.shape[0]))
+
+
+def _digit_sized(stats: np.ndarray, cell_height: int) -> list:
+    """The marks tall enough to be digits — not a point, a speck, or a rule."""
+    return [s for s in stats if 0.2 * cell_height <= s[3] <= 0.95 * cell_height
+            and s[2] >= 0.03 * cell_height and s[4] >= 12]
+
+
+def _lone_digit_reads(img: np.ndarray, box: Box, pad: int = 6) -> list[str]:
+    """Three reads of a cell holding one digit, cropped to its ink and scaled
+    to a set height. Read whole, a lone digit is a small mark in a wide,
+    mostly empty cell, and Tesseract misses it or guesses: SO 1905's clean
+    serif "5" came back blank, "9", or "8" on every whole-cell pass. Cropped
+    tight and 50px tall it reads right on every one-digit cell of SO 1892 and
+    SO 1905 — including Sialana's 5, read as 3 whole. The crop takes the
+    digit and only the marks beside it (the point of ".5"), so a speck
+    elsewhere in the cell can't shrink the digit."""
+    marks = _cell_marks(img, box, pad)
+    if marks is None:
+        return []
+    ink, stats = marks
+    digits = _digit_sized(stats, ink.shape[0])
+    if not digits:
+        return []
+    top, bottom = min(s[1] for s in digits), max(s[1] + s[3] for s in digits)
+    left, right = min(s[0] for s in digits), max(s[0] + s[2] for s in digits)
+    reach = bottom - top
+    kept = [s for s in stats if s[1] >= top - 2 and s[1] + s[3] <= bottom + 0.3 * reach
+            and s[0] + s[2] >= left - reach and s[0] <= right + reach]
+    x0, y0 = min(s[0] for s in kept), min(s[1] for s in kept)
+    x1, y1 = max(s[0] + s[2] for s in kept), max(s[1] + s[3] for s in kept)
+    digit = np.where(ink[y0:y1, x0:x1] > 0, 0, 255).astype(np.uint8)
+    reads = []
+    for height, psm in ((50, 8), (36, 8), (50, 10)):
+        scale = height / digit.shape[0]
+        sized = cv2.resize(digit, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+        _, sized = cv2.threshold(sized, 127, 255, cv2.THRESH_BINARY)
+        sized = cv2.copyMakeBorder(sized, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+        reads.append(" ".join(_run_tesseract(sized, psm, "0123456789.,").split()))
+    return reads
+
+
+def _number_crop(img: np.ndarray, box: Box, pad: int = 6) -> np.ndarray | None:
+    """A cell's number, cut close and binarized as _ocr_cell binarizes. The
+    digits are the marks of the commonest height (by ink), so a pen tick or
+    a speck of grain beside them is left out; a point or comma between them
+    is kept. The marks only locate the number — the crop is thresholded from
+    the greyscale page, since the stricter mark threshold breaks a thin, pale
+    "3" into four pieces that read as "2"."""
+    marks = _cell_marks(img, box, pad)
+    if marks is None:
+        return None
+    _, stats = marks
+    stats = [s for s in stats if s[4] >= 12]
+    if not stats:
+        return None
+    alike = lambda height: [s for s in stats if 0.75 * height <= s[3] <= 1.33 * height]
+    digits = alike(max(stats, key=lambda s: sum(t[4] for t in alike(s[3])))[3])
+    top, bottom = min(s[1] for s in digits), max(s[1] + s[3] for s in digits)
+    left, right = min(s[0] for s in digits), max(s[0] + s[2] for s in digits)
+    reach = bottom - top
+    kept = [s for s in stats if s[1] >= top - 0.15 * reach and s[1] + s[3] <= bottom + 0.3 * reach
+            and s[0] + s[2] >= left - reach and s[0] <= right + reach]
+    x0, y0 = min(s[0] for s in kept), min(s[1] for s in kept)
+    x1, y1 = max(s[0] + s[2] for s in kept), max(s[1] + s[3] for s in kept)
+    cx, cy = box[0] + pad, box[1] + pad
+    gray = cv2.cvtColor(img[max(0, cy + y0 - 2) : cy + y1 + 2, max(0, cx + x0 - 2) : cx + x1 + 2], cv2.COLOR_BGR2GRAY)
+    _, binarized = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binarized
+
+
+def _scaled_reads(img: np.ndarray | None, boxes: list[Box], whitelist: str) -> list[str]:
+    """Two reads of a number cell, cut close and scaled so the digits are 24
+    and 32px tall. Every other read scales the whole cell 3x, whatever size
+    its print — SO 1849's thin, pale digits come out 80px tall, and Tesseract
+    reads "5.252" as "9.2902" at that size. The same 5-for-9 misread blanked
+    or mis-ticked rows of SO 1870, 1897 and 1903 and of Pedro Roa. At
+    24-32px they read right. A cell split in two by a pen stroke isn't one
+    number to crop, and gets no reads."""
+    if img is None or len(boxes) != 1:
+        return []
+    number = _number_crop(img, boxes[0])
+    if number is None or number.size == 0:
+        return []
+    reads = []
+    for height in (24, 32):
+        scale = height / number.shape[0]
+        sized = cv2.resize(number, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+        _, sized = cv2.threshold(sized, 127, 255, cv2.THRESH_BINARY)
+        sized = cv2.copyMakeBorder(sized, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+        reads.append(" ".join(_run_tesseract(sized, 7, whitelist).split()))
+    return reads
+
+
+# "TI", "THI", "TUHI": a T and what OCR made of the strokes after it. No V or
+# X — those aren't stems — and no spelled-out "TEACHER".
+_STEMMED_POSITION_RE = re.compile(r"^T[-_]?[IHUL1|!\]\[]+$")
+
+
+def _count_stems(img: np.ndarray, box: Box, pad: int = 6) -> int | None:
+    """How many upright strokes a "TIII"-style position cell has — the T's and
+    one per I. Serif I's touch, and OCR fuses them into H's and U's: SO 2159's
+    TIII came back "THI", "TUHI" and "TII", and its TII as "TI". Counted
+    across a band below the T's bar and above where a hyphen sits, every
+    stroke is one run of ink, however its serifs join it to the next."""
+    x, y, w, h = box
+    crop = img[y + pad : y + h - pad, x + pad : x + w - pad]
+    if crop.size == 0:
+        return None
+    _, ink = cv2.threshold(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    marks = [s for s in stats[1:] if s[3] >= 0.3 * crop.shape[0] or s[4] > 40]
+    if not marks:
+        return None
+    tallest = max(s[3] for s in marks)
+    glyphs = [s for s in marks if s[3] >= 0.6 * tallest]
+    top, bottom = min(s[1] for s in glyphs), max(s[1] + s[3] for s in glyphs)
+    left, right = min(s[0] for s in glyphs), max(s[0] + s[2] for s in glyphs)
+    height = bottom - top
+    band = ink[top + int(0.25 * height) : top + int(0.42 * height) + 1, left : right + 1] > 0
+    if band.size == 0:
+        return None
+    inked = band.mean(axis=0) > 0.5
+    return int(inked[0]) + int(np.count_nonzero(inked[1:] & ~inked[:-1]))
+
+
+def _thick_read(img: np.ndarray | None, boxes: list[Box], whitelist: str) -> str:
+    """One more read of a number cell, made a third way: scaled 2x and its
+    strokes thickened. Thin serif print (SO 2159's) reads 5 as 9 and 7 as 1
+    under the 3x whole-cell reads — and two of those share one binarization,
+    so they make the same mistake twice and outvote the right answer. Thick
+    strokes keep the 5's open top and the 7's bar: 43 of SO 2159's 44 figures
+    read right this way, and the 44th came back empty, not wrong."""
+    if img is None or len(boxes) != 1:
+        return ""
+    x, y, w, h = boxes[0]
+    crop = img[y + 4 : y + h - 4, x + 4 : x + w - 4]
+    if crop.size == 0:
+        return ""
+    gray = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    _, binarized = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thick = cv2.erode(binarized, np.ones((3, 3), np.uint8))     # black ink on white: eroding white thickens it
+    thick = cv2.copyMakeBorder(thick, 14, 14, 14, 14, cv2.BORDER_CONSTANT, value=255)
+    return " ".join(_run_tesseract(thick, 7, whitelist).split())
+
+
+def _drop_pen_ink(img: np.ndarray, keep_rules: bool = False) -> np.ndarray:
+    """The page with blue pen ink turned to paper.
+
+    Orders are printed in black; what's blue on a colour scan is a pen — the
+    signature, initials, the hand-written SO number. SO 2159's signature line
+    runs down through four rows' hours and credits ("114", "28.5"), and in
+    greyscale it is just more ink: those rows read as "728.9" or not at all.
+    By colour the stroke and the print come apart cleanly.
+
+    Blue means blue well above red and green and not dark: in near-black
+    print the channels are almost equal, and saturation alone is useless
+    there (it's noisy wherever the brightest channel is tiny). A greyscale
+    scan has no such pixels and comes back unchanged.
+
+    keep_rules: leave the pen's crossing of a horizontal rule printed black,
+    for finding cells. A signature runs down the page, so the long horizontals
+    under it are rules and its own strokes never are."""
+    if img.ndim != 3:
+        return img
+    b, g, r = (img[..., i].astype(np.int16) for i in range(3))
+    pen = (b - r > 50) & (b - g > 15) & (b > 90)
+    if not pen.any():
+        return img
+    ink = pen
+    # The stroke's anti-aliased edge is a shade less blue than its core — but
+    # only bluish pixels are its edge. Growing into neutral ones bit the top
+    # off the "2" of a "28.5" it crossed, which then read as 28.9.
+    pen = (cv2.dilate(pen.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0) & (b - r > 15)
+    out = img.copy()
+    out[pen] = 255
+    if keep_rules:
+        out[_printed_rules(img, out, pen, ink)] = 0
+    return out
+
+
+def _printed_rules(img: np.ndarray, clean: np.ndarray, pen: np.ndarray, ink: np.ndarray) -> np.ndarray:
+    """Where the table's rules ran under pen ink that has been removed. Losing
+    even a few of those pixels opens a cell's corner: SO 2159's last column
+    merged five rows deep where its signature crossed, and SO 1898's "-do-"
+    joined the hours beside it where initials were scrawled on the corner.
+
+    Two ways, since each misses what the other finds. A rule segment of the
+    page as scanned that is mostly not pen ink is printed, and its pixels under
+    the pen are kept — but a thick scrawl thresholds hollow, so the rule
+    inside it isn't seen. Then the gaps left between collinear rule segments
+    of the cleaned page, where the pen was, are bridged. A signature's
+    downstroke is neither — mostly pen, and nothing on either side of a gap —
+    so it never becomes a column rule (kept, it cut SO 2159's "75" in half)."""
+    h, w = pen.shape
+    rules = np.zeros(pen.shape, dtype=bool)
+    thr = _binary_threshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    for size in ((w // 30, 1), (1, h // 60)):
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, size)
+        lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(lines, connectivity=8)
+        if n > 1:
+            printed = np.bincount(labels[ink], minlength=n) < 0.5 * stats[:, cv2.CC_STAT_AREA]
+            printed[0] = False
+            rules |= printed[labels] & pen
+    thr = _binary_threshold(cv2.cvtColor(clean, cv2.COLOR_BGR2GRAY)) | (rules * 255).astype(np.uint8)
+    near_pen = cv2.dilate(pen.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    # Bridged 3px wide: a scanned rule wanders a pixel or two either side. And
+    # from shorter segments than a rule is found by: what's left of one between
+    # a scrawl and the row's corner can be 30px (SO 1898's Estrella-Turnuas).
+    for size, bridge in (((w // 60, 1), (w // 15, 3)), ((1, h // 120), (3, h // 30))):
+        lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, size))
+        closed = cv2.morphologyEx(lines, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, bridge))
+        rules |= (closed > 0) & near_pen
+    return rules
 
 def _has_pen_stroke(img: np.ndarray, boxes: list[Box], pad: int = 4) -> bool:
     """Whether a thick pen stroke crosses the cell (or the cells one split
@@ -2345,6 +3032,71 @@ def _split_ruleless_columns(
     return grouped, grid
 
 
+def _split_columns(before: list[tuple[int, int]], after: list[tuple[int, int]]) -> list[int]:
+    """Which columns of `before` _split_ruleless_columns cut in two to give `after`."""
+    split, j = [], 0
+    for i, (_, right) in enumerate(before):
+        if j < len(after) and after[j][1] != right:
+            split.append(i)
+            j += 2
+        else:
+            j += 1
+    return split
+
+
+def _split_like_layout(
+    img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]], layout: dict,
+) -> tuple[list[list[Box]], list[tuple[int, int]]]:
+    """Split the columns an earlier page of the order split for having no rule
+    between two fields, along this page's own gap in the text. Left as it was
+    unless every one of them splits and the result has as many columns as the
+    earlier page's labels — a page that doesn't line up is no continuation."""
+    ruleless = layout["ruleless"]
+    if len(grid) + len(ruleless) != len(layout["labels"]):
+        return grouped, grid
+    splits = []
+    for i in ruleless:
+        left, right = grid[i]
+        column = [b for row in grouped for b in row if abs(b[0] - left) < 10 and abs(b[0] + b[2] - right) < 10]
+        split = _find_ruleless_split(img, column)
+        if split is None:
+            return grouped, grid
+        splits.append(split)
+
+    def cut(boxes: list[Box]) -> list[Box]:
+        out = []
+        for bx, by, bw, bh in boxes:
+            s = next((s for s in splits if bx + 10 < s < bx + bw - 10), None)
+            out.extend([(bx, by, bw, bh)] if s is None else [(bx, by, s - bx, bh), (s, by, bx + bw - s, bh)])
+        return out
+
+    new_grid = []
+    for left, right in grid:
+        s = next((s for s in splits if left + 10 < s < right - 10), None)
+        new_grid.extend([(left, s), (s, right)] if s is not None else [(left, right)])
+    return [cut(row) for row in grouped], new_grid
+
+
+def _has_vertical_rules(img: np.ndarray, grid: list[tuple[int, int]], y: int, height: int) -> bool:
+    """Whether the column rules run through this strip — what makes it a table
+    row and not the text below the table. A page's footer ("Address: Fr.
+    William F. Masterson Ave...") has ink, but no rules."""
+    if len(grid) < 2 or height < 8:
+        return False
+    strip = cv2.cvtColor(img[y : y + height, :], cv2.COLOR_BGR2GRAY)
+    if strip.size == 0:
+        return False
+    dark = strip < np.median(strip) - 70
+    boundaries = [right for _, right in grid[:-1]]
+    with_rule = 0
+    for x in boundaries:
+        band = dark[:, max(0, x - 5) : x + 6]
+        # A rule is dark down (nearly) the whole strip in at least one column.
+        if band.size and band.mean(axis=0).max() >= 0.6:
+            with_rule += 1
+    return with_rule >= max(1, int(0.6 * len(boundaries)))
+
+
 def _extend_open_bottom(img: np.ndarray, grouped: list[list[Box]], grid: list[tuple[int, int]]) -> list[list[Box]]:
     """Recover rows below the last closed cell of a table whose bottom rules
     weren't printed or didn't scan. Kauswagan's Annex D runs its column rules
@@ -2353,7 +3105,9 @@ def _extend_open_bottom(img: np.ndarray, grouped: list[list[Box]], grid: list[tu
 
     The dewarped page ends where the table's rules do, so whatever height is
     left below the last row is table. It's cut into rows at the pitch the
-    closed rows keep, and a strip is kept only if it has text in it."""
+    closed rows keep, and a strip is kept only if it has text in it *and* the
+    column rules run through it: East Gusa's page footer sits inside the
+    dewarped area, and was read as a row."""
     rows = [r for r in grouped if len(r) >= 2]
     if len(rows) < 3:
         return grouped
@@ -2372,7 +3126,7 @@ def _extend_open_bottom(img: np.ndarray, grouped: list[list[Box]], grid: list[tu
     for i in range(n):
         y = int(bottom + i * step)
         row = [(left, y, right - left, int(step)) for left, right in grid]
-        if sum(_ink_profile(img, b) is not None for b in row) >= 2:
+        if sum(_ink_profile(img, b) is not None for b in row) >= 2 and _has_vertical_rules(img, grid, y, int(step)):
             added.append(row)
     return grouped + added
 
@@ -2446,6 +3200,26 @@ def _labels_from_samples(columns: list[list[str]]) -> list[str | None] | None:
         numbered = [i for i, label in enumerate(labels) if label == "no"]
         for i in numbered[1:]:
             labels[i] = "hours"
+    # A grant whose hours and credits are both whole numbers ("40", "5" — East
+    # Gusa's Brigada Eskwela) has no decimal to give the credits away, so all
+    # three number columns read alike. The first is the row number; the two
+    # after the dates are hours and then credits, in the order every grant form
+    # prints them. Not for a leave form: any days, type or action column means
+    # the numbers are something else.
+    if "dates" in labels and not {"credits", "hours", "days", "type", "action"} & set(labels):
+        numbered = [i for i, label in enumerate(labels) if label == "no"]
+        after_dates = [i for i in numbered if i > labels.index("dates")]
+        if len(numbered) >= 3 and len(after_dates) >= 2:
+            labels[after_dates[0]], labels[after_dates[1]] = "hours", "credits"
+    # A grant with a School column (SO 1893: "MACASANDIG NHS") has two columns of
+    # capitalised words side by side. The first is the teacher; reading both
+    # as the name glued the school onto every teacher ("Arquero Macasandig
+    # Nhs, Ma. Dorothy...") and no HRIS search finds that. Only for a grant:
+    # a leave form's names come split by their headers, not by content.
+    if {"hours", "credits"} & set(labels):
+        name_columns = [i for i, label in enumerate(labels) if label == "name"]
+        if len(name_columns) == 2 and name_columns[1] == name_columns[0] + 1:
+            labels[name_columns[1]] = None
     found = set(labels)
     if "name" not in found or not found & {"dates", "days"}:
         return None
@@ -2470,7 +3244,51 @@ def _infer_header_from_content(img: np.ndarray, grouped: list[list[Box]], grid: 
     return mapping, header_boxes
 
 
-def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> tuple[list[Form6Row], int, Counter[int]]:
+def _header_from_labels(labels: list[str | None], grid: list[tuple[int, int]]):
+    """A header mapping, in _map_header_row's shape, from one label per column."""
+    header_boxes = [(left, 0, right - left, 1) for left, right in grid]
+    return {box[0]: label for box, label in zip(header_boxes, labels) if label}, header_boxes
+
+
+def _labels_of(header, grid: list[tuple[int, int]]) -> list[str | None]:
+    """The label a header gives each grid column."""
+    return _fields_for_row(header[0], header[1], [(left, 0, right - left, 1) for left, right in grid])
+
+
+def _doubtful(header, grid: list[tuple[int, int]] | None) -> bool:
+    """Whether labels read from a page's content can't be trusted: none at all,
+    or two columns both called the name (a school beside the teacher)."""
+    if header is None:
+        return True
+    return grid is not None and [l for l in _labels_of(header, grid) if l == "name"].__len__() > 1
+
+
+def _rebuild_rows(boxes: list[Box], grid: list[tuple[int, int]]) -> list[list[Box]]:
+    """Rows for a page whose own grid fell apart, from its number column.
+
+    SO 1893's last page has a signature scrawled across its five rows: cells
+    are cut into fragments, and the right-hand column has no closing border at
+    the page's edge, so no row has all its columns. The number column, though,
+    stays clean. Each of its cells gives a row's height, and the columns come
+    from an earlier page of the same order, whose layout this page shares.
+    Only used when the page has no header of its own."""
+    left, right = grid[0]
+    width = right - left
+    numbers = sorted(
+        (b for b in boxes if abs(b[0] - left) <= 0.25 * width and 0.6 * width <= b[2] <= 1.4 * width and b[3] >= 30),
+        key=lambda b: b[1],
+    )
+    rows: list[Box] = []
+    for b in numbers:
+        if rows and b[1] < rows[-1][1] + 0.5 * rows[-1][3]:
+            continue        # the same row cut twice
+        rows.append(b)
+    return [[(l, b[1], r - l, b[3]) for l, r in grid] for b in rows]
+
+
+def _extract_page(
+    img: np.ndarray, seq_start: int, earlier_event: str = "", context: dict | None = None,
+) -> tuple[list[Form6Row], int, Counter[int]]:
     """Run the full per-page pipeline (table detection through row
     extraction) on one page image. Returns (rows, next seq_start, counts of
     rows no layout could read) — seq is the running row-number counter for
@@ -2481,24 +3299,51 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
     content of its cells, for a continuation page with no header; and only
     then the fixed layouts this tool knew before either. Nothing is carried
     over from an earlier page — every page is dewarped to its own size and
-    offset, so column positions from one don't line up with the next."""
+    offset, so column positions from one don't line up with the next.
+
+    `context` carries what the caller and the page pass to each other, without
+    widening the return: in, "period" (the order's stated period, from an
+    earlier page); out, "period" (this page's, if it states one) and "notes"
+    (things the reader saw and skipped, for the user)."""
+    context = context if context is not None else {}
+    context.setdefault("notes", [])
     page_text = _page_text(img)
     default_year = _detect_default_year(page_text)
     event = _event_from_text(page_text)
-    if not event and not re.search(r"hereby\s+granted|rendered|special\s+order", page_text, re.IGNORECASE):
+    period = _period_from_text(page_text, default_year)
+    if not re.search(r"hereby\s+granted|rendered|special\s+order", page_text, re.IGNORECASE):
         # A continuation page repeats the table but not the paragraph naming
-        # the event. One that has its own order paragraph is a different order,
-        # though, and never borrows: an unread event beats a wrong one.
-        event = earlier_event
-    warped = _dewarp_table(img)
-    boxes = _find_cell_boxes(warped)
+        # the event and period. One that has its own order paragraph is a
+        # different order, though, and never borrows: an unread event beats a
+        # wrong one.
+        event = event or earlier_event
+        period = period or context.get("period")
+    if default_year is None and period:
+        # A continuation page may print no year anywhere, and SO 2159's dates
+        # ("5/6-8,11-15") carry none of their own: the order's year is theirs.
+        default_year = int(period[0][:4])
+    context["period"] = period
+    # Everything is read with pen ink removed (_drop_pen_ink). The cells are
+    # found on a copy that keeps the rules under it: where SO 2159's signature
+    # crossed a row's bottom rule, removing it all merged the last column into
+    # one cell five rows tall — and keeping it all made its downstroke a
+    # column rule, cutting Ecobiza's "75" in half.
+    inked, lines, warped = _dewarp_table(img, _drop_pen_ink(img, keep_rules=True), _drop_pen_ink(img))
+    boxes = _find_cell_boxes(lines)
     grouped = [sorted(row, key=lambda b: b[0]) for row in _group_into_rows(boxes)]
 
     grid = _column_grid(grouped)
     if grid:
-        grouped = [_fill_row_to_grid(row, grid) for row in grouped]
+        grouped = [_fill_row_to_grid(row, grid) for row in grouped if _sits_on_grid(row, grid)]
     # Needs no grid: a one-teacher order has too few rows to agree on one.
+    unsplit_grid = grid
     grouped, grid = _split_ruleless_columns(warped, grouped, grid)
+    layout = context.get("layout")
+    if grid and grid == unsplit_grid and layout and layout.get("ruleless"):
+        # A continuation page has no header to say a column is two fields, but
+        # the first page's did — SO 2159's page 2 printed "76  14.252" in one
+        # cell on every row and read nothing.
+        grouped, grid = _split_like_layout(warped, grouped, grid, layout)
     if grid:
         grouped = _extend_open_bottom(warped, grouped, grid)
 
@@ -2510,17 +3355,36 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
     # for reading cells, but two are enough to say where a merged header —
     # "No. of Hours Served" and "No. Vacation Service Credits" — divides.
     header_grid = grid or _column_grid(grouped, min_rows=2)
+    own_header = False
     for candidate in grouped[:3]:
         header = _map_header_row(warped, candidate, header_grid)
         if header:
+            own_header = True
             break
     if header is None and grid:
         header = _infer_header_from_content(warped, grouped, grid)
+        if layout and len(layout["labels"]) == len(grid) and _doubtful(header, grid):
+            # A continuation page of columns of "-do-" says nothing about what
+            # they are; the first page's header did.
+            header = _header_from_labels(layout["labels"], grid)
+    elif header is None and layout and not grid:
+        scale = warped.shape[1] / layout["width"]
+        carried = [(round(l * scale), round(r * scale)) for l, r in layout["grid"]]
+        rebuilt = _rebuild_rows(boxes, carried)
+        if rebuilt:
+            grouped, grid = rebuilt, carried
+            header = _header_from_labels(layout["labels"], grid)
+    if own_header and grid:
+        # What later pages of this order can use when they have no header.
+        context["layout"] = {
+            "labels": _labels_of(header, grid), "grid": grid, "width": warped.shape[1],
+            "ruleless": _split_columns(unsplit_grid, grid) if unsplit_grid else [],
+        }
 
     results: list[Form6Row] = []
     seq = seq_start
     unmatched: Counter[int] = Counter()
-    previous: Form6Row | None = None
+    previous: Form6Row | None = context.get("previous")
     for row_boxes in grouped:
         if header and len(row_boxes) > 1.5 * len(header[1]):
             # Several rows chained into one: a crooked photo's rows overlap in
@@ -2538,9 +3402,15 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
                 # Every grant states its figures, even if only as "-do-". A
                 # row with neither is a blank line of a pre-printed form,
                 # whatever its name cell's paper grain OCR'd as.
+                listed = _listed_name(" ".join(
+                    _ocr_cell(warped, box, 6, None) for box, label in zip(row_boxes, labels) if label == "name"
+                ))
+                if listed:
+                    # A name, and nothing else: on the paper, not in the table.
+                    context["notes"].append(f"{listed} is listed with no hours or credits, so isn't in the review table.")
                 continue
             seq += 1
-            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq, previous, event)
+            row_results = _extract_mapped_row(warped, row_boxes, labels, default_year, seq, previous, event, period, inked)
         # No readable header (a cropped photo, a table with no header row on
         # this page): fall back to recognising the handful of layouts this
         # tool knew before headers were read, purely by column count.
@@ -2563,7 +3433,14 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
         if row_results:
             results.extend(row_results)
             if row_results[-1].kind == "vsc":
-                previous = row_results[-1]
+                row = row_results[-1]
+                if previous is None or not row.parse_warning or row.trusted:
+                    # Only a row that read cleanly is the row above: a flagged
+                    # one may hold a misread ("4" for "-do-"), and every "-do-"
+                    # below would repeat it. Which columns are "-do-" columns
+                    # is remembered across rows.
+                    seen = tuple(sorted(set(row.inherited) | set(previous.inherited if previous else ())))
+                    previous = replace(row, inherited=seen)
         elif len(row_boxes) > 1:
             # A row nothing could read: an unlabelled layout, a header row, or
             # a different DepEd form that happens to be a table of names.
@@ -2571,8 +3448,22 @@ def _extract_page(img: np.ndarray, seq_start: int, earlier_event: str = "") -> t
             # "0 rows" — only ever read when the document yielded nothing.
             unmatched[len(row_boxes)] += 1
 
+    _apply_period(results, context["period"])
     _repair_row_numbers(results)
+    context["previous"] = previous
     return results, seq, unmatched
+
+
+_LISTED_NAME_RE = re.compile(r"[A-Z][A-Za-z.'\- ]+,[A-Za-z.,'\- ]{3,}")
+
+
+def _listed_name(text: str) -> str | None:
+    """The name in a cell of a row that has no figures — "SALALIMA, RALPHA." —
+    or None when the text isn't a name. A comma is required: paper grain read
+    as letters ("Nnn eee an NNN") has none, and a pre-printed blank row must
+    not be reported as a teacher."""
+    text = " ".join(text.split())
+    return text if _LISTED_NAME_RE.fullmatch(text) else None
 
 
 def _repair_row_numbers(rows: list[Form6Row]) -> None:
@@ -2594,6 +3485,150 @@ def _repair_row_numbers(rows: list[Form6Row]) -> None:
         if prev_no.isdigit() and next_no.isdigit() and int(next_no) == int(prev_no) + 2 and no != str(int(prev_no) + 1):
             for row in run:
                 row.row_no = str(int(prev_no) + 1)
+
+
+def _flag_passes_that_disagree(kept: list[Form6Row], other: list[Form6Row]) -> None:
+    """Two reads of one page (as scanned, and straightened) are two independent
+    readings. Where both gave a figure for a teacher and the figures differ,
+    neither can be trusted: SO 1892's "5" was unreadable as scanned and read as
+    "3" by every pass once straightened — silently wrong, the worst kind.
+    Rows are matched by number and the start of the surname; a figure one pass
+    couldn't read at all isn't a disagreement."""
+    theirs = {(r.row_no, r.last_name[:3].lower()): r for r in other if r.kind == "vsc"}
+    for row in kept:
+        match = theirs.get((row.row_no, row.last_name[:3].lower())) if row.kind == "vsc" else None
+        if not match:
+            continue
+        differ = []
+        if row.earned and match.earned and abs(float(row.earned) - float(match.earned)) > 1e-6:
+            differ.append(f"credits ({row.earned} or {match.earned})")
+        if row.hours is not None and match.hours is not None and row.hours != match.hours:
+            differ.append(f"hours ({row.hours:g} or {match.hours:g})")
+        if row.date_from and match.date_from and (row.date_from, row.date_to) != (match.date_from, match.date_to):
+            differ.append(f"dates ({_format_period(row.date_from, row.date_to)} or {_format_period(match.date_from, match.date_to)})")
+        if differ:
+            note = f"Two readings of this page disagree on the {', '.join(differ)} — check against the paper."
+            row.parse_warning = f"{row.parse_warning} {note}" if row.parse_warning else note
+            row.in_scope = False
+
+
+# The fewest rows sharing one grant that make it the order's norm.
+_ORDER_NORM_MIN_ROWS = 5
+
+
+def _flag_rows_unlike_their_order(rows: list[Form6Row]) -> None:
+    """Most orders grant most of their teachers the same thing: SO 1898 is 32
+    hours for 6 credits on 109 of 111 rows. Where most rows of an order (rows
+    sharing an event) agree on one pair, a row with the same hours and other
+    credits has a misread — 32 hours can't earn 6 credits for one teacher and
+    2 for the next, whatever the office's method.
+
+    The same credits for other hours is a misread only when the order's pair
+    is exactly the formula: SO 1898's 6 for 32 hours can't also come from 34.
+    Offices that cap or cut their grants give the same figure for different
+    hours — SO 1892 grants 5 for 40 hours and, rightly, 5 for Paican's 32.
+
+    A row matching neither figure is a different grant (24 hours for 4.5) and
+    is left alone, as is a row with either figure unread. Nothing is changed,
+    only unticked and explained: SO 1898's Aniñon read as 2 credits and Aluro
+    as 34 hours, both believable on their own and both ticked for submission."""
+    orders: dict[str, list[Form6Row]] = {}
+    for row in rows:
+        if row.kind == "vsc" and row.hours is not None and row.earned:
+            orders.setdefault(row.event, []).append(row)
+    for order in orders.values():
+        pairs = Counter((round(r.hours, 3), float(r.earned)) for r in order)
+        (hours, credits), count = pairs.most_common(1)[0]
+        if count < _ORDER_NORM_MIN_ROWS or 2 * count <= len(order):
+            continue
+        at_formula = _earned_at_formula(hours, credits)
+        for row in order:
+            same_hours = round(row.hours, 3) == hours
+            same_credits = abs(float(row.earned) - credits) < 1e-9
+            if same_hours == same_credits or (same_credits and not at_formula):
+                continue
+            note = (
+                f"{count} of {len(order)} rows in this order are {hours:g} hrs for {credits:g} credits, "
+                f"but this one reads {row.hours:g} hrs for {row.earned} — one of the two is likely misread; "
+                "check both against the paper."
+            )
+            row.parse_warning = f"{row.parse_warning} {note}" if row.parse_warning else note
+            row.in_scope = False
+
+
+# The share of an order's names with a comma that makes it a "Last, First" order.
+_COMMA_NAMES_SHARE = 0.75
+
+
+# Words that begin a Filipino compound surname: "DELA VEGA", "DE LOS SANTOS".
+_SURNAME_PARTICLES = {"DE", "DEL", "DELA", "DELOS", "LA", "LOS", "SAN", "STA", "STA.", "STO", "STO."}
+
+
+def _surname_comma(tokens: list[str]) -> str:
+    """A comma-less "LAST FIRST M." name with its comma put back. A period
+    typed for the comma marks it ("DELA VEGA. ARA NICOLE BACONG", SO 1892) —
+    after a word, not an initial or a suffix; otherwise the surname is the
+    first word, with any particles that start it ("DELA VEGA")."""
+    for i, token in enumerate(tokens[:-1]):
+        word = token.rstrip(".")
+        if token.endswith(".") and len(word) >= 3 and word.upper() not in _NAME_SUFFIXES | _SURNAME_PARTICLES:
+            return f"{' '.join(tokens[:i])} {word}, {' '.join(tokens[i + 1:])}".strip()
+    n = 1
+    while n < len(tokens) - 1 and tokens[n - 1].upper() in _SURNAME_PARTICLES:
+        n += 1
+    return f"{' '.join(tokens[:n])}, {' '.join(tokens[n:])}"
+
+
+def _surname_first_like_the_rest(rows: list[Form6Row]) -> list[str]:
+    """Re-read a grant's name printed without its comma surname first, when
+    the rest of its order is "LAST, FIRST M." — SO 2159's "OLARTE ROY PHILIP"
+    among 21 such names was read "First Last", as a name with no comma
+    usually is on a grant, and became Philip, Olarte Roy. Says so in a note,
+    since only the paper (or HRIS) settles which word is the surname."""
+    orders: dict[str, list[Form6Row]] = {}
+    for row in rows:
+        if row.kind == "vsc" and row.name_raw:
+            orders.setdefault(row.event, []).append(row)
+    notes = []
+    for order in orders.values():
+        commaless = [r for r in order if "," not in r.name_raw]
+        if len(order) < 4 or len(order) - len(commaless) < _COMMA_NAMES_SHARE * len(order):
+            continue
+        for row in commaless:
+            tokens = row.name_raw.split()
+            if len(tokens) < 2:
+                continue
+            last, first, mi = _split_combined_name(_surname_comma(tokens))
+            if not first:
+                continue
+            row.last_name, row.first_name, row.middle_initial = last, first, mi
+            notes.append(
+                f"Row {row.row_no}: \"{' '.join(tokens)}\" has no comma; read surname first "
+                f"({last}, {first}) like the rest of the order — check it when matching to HRIS."
+            )
+    return notes
+
+
+def _page_score(rows: list[Form6Row]) -> tuple[int, int]:
+    """How well a page read: rows with no warning first, then rows at all."""
+    return sum(1 for r in rows if not r.parse_warning), len(rows)
+
+
+def _enforce_increasing_numbers(rows: list[Form6Row]) -> None:
+    """Within one order, a grant's number that doesn't go up is a misread.
+
+    SO 1893's last rows sit under the signature: 50-57 read as "30, 1, 2, 3,
+    4, 5, 06" — the number column is cosmetic (it never reaches HRIS) but a
+    review table numbered 30, 1, 2 looks like duplicates. A row that doesn't
+    exceed the one above takes that plus one. Scoped to one order (rows sharing
+    an event) so two orders in a PDF that each restart at 1 are left alone."""
+    last: Form6Row | None = None
+    for row in rows:
+        if row.kind != "vsc" or not row.row_no.isdigit():
+            continue
+        if last is not None and last.event == row.event and int(row.row_no) <= int(last.row_no):
+            row.row_no = str(int(last.row_no) + 1)
+        last = row
 
 
 # A page yielding nothing, or losing most of its rows, is reported rather than
@@ -2621,6 +3656,10 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
     several_tables: list[tuple[str, int]] = []
     failed_pages: list[int] = []
     event = ""
+    period: tuple[str, str] | None = None
+    # What one page of an order passes to the next: its column layout, and its
+    # last grant (for "-do-" cells that open a page).
+    carry: dict = {}
     for i, img in enumerate(pages, start=1):
         img = _upright(img)
         where = f"Page {i}" if len(pages) > 1 else "This page"
@@ -2628,29 +3667,37 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
         if tables > 1:
             several_tables.append((where, tables))
         try:
-            try:
-                page_results, next_seq, page_unmatched = _extract_page(img, seq, event)
-                first_error = None
-            except ValueError as e:
-                page_results, next_seq, page_unmatched, first_error = [], seq, Counter(), e
-            if not page_results:
-                # Nothing read as scanned. If the page is tilted, its rules may
-                # have broken into fragments (SO 1891 tilts 1.5-2.7 degrees):
-                # straighten it and try once more. Only ever after a failure,
-                # because straightening resamples every digit — and a page that
-                # read fine must keep reading exactly as it did.
-                straight = _deskew(img)
-                if straight is not img:
-                    try:
-                        retry = _extract_page(straight, seq, event)
-                    except ValueError:
-                        retry = None
-                    if retry and retry[0]:
-                        page_results, next_seq, page_unmatched = retry
-                        first_error = None
-            if first_error is not None:
+            def attempt(image, seq=seq, event=event, period=period, carry=carry):
+                ctx: dict = {"period": period, "notes": [], **carry}
+                try:
+                    return _extract_page(image, seq, event, ctx), None, ctx
+                except ValueError as e:
+                    return None, e, ctx
+
+            first, first_error, context = attempt(img)
+            poor = first is None or not first[0] or bool(first[2]) or any(r.parse_warning for r in first[0])
+            straight = _deskew(img) if poor else img
+            if straight is not img:
+                # A tilted page's rules break into fragments (SO 1891-1893 tilt
+                # 1.5-3.2 degrees): nothing may read at all, or a cropped table
+                # may read partly (SO 1892's credits column, cut to 68px).
+                # Straighten it and read again, and keep whichever gives more
+                # rows without a warning. Only when the first read was poor,
+                # because straightening resamples every digit — a page that
+                # read cleanly must keep reading exactly as it did.
+                second, _, second_context = attempt(straight)
+                if second and second[0]:
+                    if first is None or not first[0]:
+                        first, first_error, context = second, None, second_context
+                    else:
+                        if _page_score(second[0]) > _page_score(first[0]):
+                            (first, first_error, context), other = (second, None, second_context), first
+                        else:
+                            other = second
+                        _flag_passes_that_disagree(first[0], other[0])
+            if first is None:
                 raise first_error
-            seq = next_seq
+            page_results, seq, page_unmatched = first
         except ValueError as e:
             # A page with no detectable table (e.g. a PDF cover/signature
             # page) shouldn't abort a multi-page document — skip it, but
@@ -2661,6 +3708,9 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
         unmatched.update(page_unmatched)
         results.extend(page_results)
         event = next((r.event for r in reversed(page_results) if r.event), event)
+        period = context["period"] or period
+        carry = {k: context[k] for k in ("layout", "previous") if context.get(k)} or carry
+        notes.extend(f"{where}: {n}" for n in context["notes"])
 
         dropped = sum(page_unmatched.values())
         if tables > 1:
@@ -2683,6 +3733,9 @@ def extract_form6_with_notes(image_path: str) -> tuple[list[Form6Row], list[str]
     # Per page it can't see a number at a page's edge, whose neighbour is on the
     # next page. Harmless twice over: it only fixes a number breaking a count.
     _repair_row_numbers(results)
+    _enforce_increasing_numbers(results)
+    _flag_rows_unlike_their_order(results)
+    notes.extend(_surname_first_like_the_rest(results))
     if results and failed_pages:
         # Not silently: a page whose table can't be found is teachers missing.
         # (A cover or signature page has no table either, and costs only this
