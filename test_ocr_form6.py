@@ -682,7 +682,7 @@ def _fake_pages(page_outcomes, tables=1):
     from collections import Counter
     outcomes = iter(page_outcomes)
 
-    def fake_extract(img, seq, earlier_event=""):
+    def fake_extract(img, seq, earlier_event="", context=None):
         outcome = next(outcomes)
         if isinstance(outcome, Exception):
             raise outcome
@@ -802,15 +802,26 @@ def test_a_word_gap_is_not_a_column():
 
 
 def test_rows_below_the_last_closed_cell_are_recovered():
-    """Three closed rows at a 60px pitch, then 120px of unruled table holding
-    two more rows of text."""
+    """Three closed rows at a 60px pitch, then 120px of table whose column rules
+    continue but whose row rules are missing, holding two more rows of text."""
+    import cv2
     grid = [(0, 100), (100, 400)]
     grouped = [[(0, y, 100, 60), (100, y, 300, 60)] for y in (0, 60, 120)]
     img = _page_with_text(300, 400, [("7", 30, 222), ("CLERIGO, IRENE", 120, 222),
                                      ("8", 30, 282), ("LABISCASE, S", 120, 282)])
+    cv2.line(img, (100, 180), (100, 299), (0, 0, 0), 2)      # the column rule, running on down
     out = ocr_form6._extend_open_bottom(img, grouped, grid)
     assert len(out) == 5
     assert [row[0][1] for row in out[3:]] == [180, 240]
+
+
+def test_footer_text_below_a_closed_table_is_not_a_row():
+    """East Gusa's page footer sits inside the dewarped area: it has ink, but no
+    column rules, and was read as a teacher ("Wi, Peed Address: Fr...")."""
+    grid = [(0, 100), (100, 400)]
+    grouped = [[(0, y, 100, 60), (100, y, 300, 60)] for y in (0, 60, 120)]
+    img = _page_with_text(300, 400, [("Address: Fr. William F.", 20, 222), ("Mobile No: +63 975 6403", 20, 282)])
+    assert ocr_form6._extend_open_bottom(img, grouped, grid) == grouped
 
 
 def test_a_closed_table_gains_no_rows():
@@ -1058,7 +1069,8 @@ def test_a_stroke_splitting_a_cell_into_two_boxes_is_still_found():
 def test_a_stroke_makes_hours_unread_but_keeps_the_credits():
     """SO 1891 row 5: "60" under a signature reads as "1" hours, which used to
     refuse the correctly read 11.251 credits and put "(1 hrs)" in the description."""
-    with patch.object(ocr_form6, "_has_pen_stroke", lambda img, boxes: True):
+    hours_box = (20, 0, 10, 10)
+    with patch.object(ocr_form6, "_has_pen_stroke", lambda img, boxes: boxes == [hours_box]):
         [row] = _vsc_row_from(
             {"name": "HAGONAO, WINDY G.", "dates": "May 4-29, 2026", "hours": "1", "credits": "11.251"},
             img=np.zeros((10, 10, 3), dtype=np.uint8),
@@ -1137,7 +1149,7 @@ def test_a_tilted_page_is_straightened_only_after_it_reads_nothing_as_scanned():
     straight, tilted = object(), object()
     calls = []
 
-    def extract(img, seq, earlier_event=""):
+    def extract(img, seq, earlier_event="", context=None):
         calls.append(img)
         if img is tilted:
             return [], seq, Counter()          # its rules broke into fragments
@@ -1156,7 +1168,7 @@ def test_a_page_that_reads_as_scanned_is_never_straightened():
     """Straightening resamples every digit; a page that read fine must not change."""
     page = object()
     with patch.object(ocr_form6, "_load_pages", lambda path: [page]), \
-         patch.object(ocr_form6, "_extract_page", lambda img, seq, ev="": ([_some_row()], seq + 1, Counter())), \
+         patch.object(ocr_form6, "_extract_page", lambda img, seq, ev="", ctx=None: ([_some_row()], seq + 1, Counter())), \
          patch.object(ocr_form6, "_count_table_regions", lambda img: 1), \
          patch.object(ocr_form6, "_upright", lambda img: img), \
          patch.object(ocr_form6, "_deskew", lambda img: pytest.fail("straightened a page that read fine")):
@@ -1172,3 +1184,653 @@ def test_a_header_split_uses_a_two_row_grid_when_no_three_row_grid_exists():
     assert ocr_form6._column_grid(grouped) is not None                        # 3 rows: the usual grid
     assert ocr_form6._column_grid(grouped[:2]) is None
     assert ocr_form6._column_grid(grouped[:2], min_rows=2) == [(0, 100), (100, 400), (400, 600), (600, 800)]
+
+
+# --- SO 1892 (East Gusa): whole-number columns, stated period, two-pass dates --
+
+@pytest.mark.parametrize("paragraph,period", [
+    ("services rendered during the Early Registration for SY 2026-2027 on Janauary 31 - February 27, 2026.",
+     ("2026-01-31", "2026-02-27")),
+    ("services rendered during BRIGADA ESKWELA from June 1-5, 2026.", ("2026-06-01", "2026-06-05")),
+    ("services rendered during DIVISION TRAINING FOR THE STRENGTHENED SENIOR HIGH SCHOOL CURRICULUM on JUNE 12-13. 2026 Held in",
+     ("2026-06-12", "2026-06-13")),
+    ("granted vacation services rendered during the 2026 SUMMER ACADEMIC REMEDIAL PROGRAM (SARP), on May 4 to 29, 2026.",
+     ("2026-05-04", "2026-05-29")),
+    ("rendered during 2026 SUMMER REMEDIATION PROGRAMS (SRP) from May 6 to June 2, 2026.", ("2026-05-06", "2026-06-02")),
+    ("rendered during CAPACITY BUILDING HELD AT FR. WILLIAM F. MASTERSON on May 25-26. 2026.", ("2026-05-25", "2026-05-26")),
+    # No stated period — or none that parses — means no check, never a guess.
+    ("No. Name Position Inclusive Dates 16 AZURA, LIEZEL A. Teacher I May 6 to May 26, 2026", None),
+    ("rendered during ORIENTATION ON THE STRENGTHENED SHS for the year", None),
+])
+def test_the_orders_stated_period(paragraph, period):
+    assert ocr_form6._period_from_text(paragraph, 2026) == period
+
+
+def _grant(no, date_from, date_to, **kw):
+    return ocr_form6.Form6Row(no, "X", "Y", "", "", "", "", "VSC", "", date_from=date_from, date_to=date_to,
+                              kind="vsc", hours=40, earned="5", in_scope=True, event="Brigada Eskwela",
+                              description="Vacation service credits, Brigada Eskwela", **kw)
+
+
+def test_a_date_outside_the_orders_period_is_flagged_and_unticked_not_changed():
+    """SO 1892 read a 5 as a 9 in "June 1,2,3,4,5": June 1-9 against an order for June 1-5."""
+    rows = [_grant("1", "2026-06-01", "2026-06-05"), _grant("2", "2026-06-01", "2026-06-09"),
+            _grant("3", "2026-06-05", "2026-06-05"), _grant("4", "2026-06-01", "2026-06-05")]
+    ocr_form6._apply_period(rows, ("2026-06-01", "2026-06-05"))
+    assert [r.in_scope for r in rows] == [True, False, True, True]
+    assert (rows[1].date_from, rows[1].date_to) == ("2026-06-01", "2026-06-09")      # kept: the doubt may be the paragraph's
+    assert "outside the order's period (June 1-5, 2026)" in rows[1].parse_warning
+    assert all(r.parse_warning is None for r in (rows[0], rows[2], rows[3]))
+
+
+def test_if_much_of_the_page_is_outside_it_is_the_paragraph_that_was_misread():
+    rows = [_grant("1", "2026-06-01", "2026-06-05"), _grant("2", "2026-07-01", "2026-07-05"),
+            _grant("3", "2026-07-01", "2026-07-05"), _grant("4", "2026-07-02", "2026-07-05")]
+    ocr_form6._apply_period(rows, ("2026-06-01", "2026-06-05"))
+    assert all(r.in_scope and r.parse_warning is None for r in rows)
+
+
+def test_no_stated_period_means_no_check():
+    rows = [_grant("1", "2026-06-01", "2026-06-25")]
+    ocr_form6._apply_period(rows, None)
+    assert rows[0].in_scope and rows[0].parse_warning is None
+
+
+PERIOD = ("2026-06-01", "2026-06-05")
+
+
+@pytest.mark.parametrize("first,second,expect_from,expect_to,warns", [
+    ("June 1,2,3,4,5, 2026", "June 1,2,3,4,5, 2026", "2026-06-01", "2026-06-05", False),   # agree
+    ("June 1,2,3,4,5,42026", "June 1,2,3,4,5,2026", "2026-06-01", "2026-06-05", False),   # only the second parses
+    ("June 1,2,3,4,9,", "June 1,2,3,4,5,", "2026-06-01", "2026-06-05", False),            # 5 misread as 9: the in-period read wins
+    ("June 1,2,3,4,5,", "June 1,2,3,4,9,", "2026-06-01", "2026-06-05", False),
+    ("June 1,2,3,4,9,", "June 1,23,4,5", "2026-06-01", "2026-06-09", True),               # both out of period: first, and say so
+])
+def test_two_reads_of_a_date_cell(first, second, expect_from, expect_to, warns):
+    raw, date_from, date_to, warning = ocr_form6._choose_dates(first, second, 2026, PERIOD)
+    assert (date_from, date_to) == (expect_from, expect_to)
+    assert bool(warning) == warns
+    if warns:
+        assert "OCR disagreed on the dates" in warning
+
+
+def test_two_reads_of_a_date_cell_agree_when_there_is_no_second_read():
+    assert ocr_form6._choose_dates("June 5, 2026", "", 2026, None)[1:3] == ("2026-06-05", "2026-06-05")
+
+
+def test_whole_number_hours_and_credits_are_told_from_the_row_number():
+    """East Gusa's continuation pages have no header, and "40" and "5" look just like "16"."""
+    columns = [["16", "17", "18"], ["DUBLIN, FLORDILYN RABUYO", "DUCA, JESSA LALUNA", "EMBATE, EMMANUEL BACARRO"],
+               ["Teacher I", "Teacher I", "Teacher II"], ["June 1,2,3,4,5, 2026", "June 5, 2026", "June 1,2,3,5, 2026"],
+               ["40", "8", "32"], ["5", "1", "4"]]
+    assert ocr_form6._labels_from_samples(columns) == ["no", "name", "position", "dates", "hours", "credits"]
+
+
+def test_a_leave_forms_numbers_are_not_mistaken_for_hours_and_credits():
+    columns = [["1", "2", "3"], ["CRUZ, ANA", "DIAZ, JOSE", "LIM, SAM"], ["June 5, 2026", "June 8, 2026", "June 9, 2026"],
+               ["1 day", "1 day", "2 days"], ["SL", "SL", "SL"], ["WP", "WP", "WP"]]
+    labels = ocr_form6._labels_from_samples(columns)
+    assert "hours" not in labels and "credits" not in labels
+
+
+@pytest.mark.parametrize("text,name", [
+    ("SALALIMA, RALPHA.", "SALALIMA, RALPHA."),
+    ("  SALALIMA,   RALPHA. ", "SALALIMA, RALPHA."),
+    ("Nnn eee an NNN", None),          # paper grain read as letters
+    ("ta aes", None),
+    ("OS", None),
+    ("", None),
+])
+def test_a_teacher_listed_with_no_entries_is_noted_but_grain_is_not(text, name):
+    """SO 1892 row 47 is "SALALIMA, RALPHA." and nothing else; Macabalan's blank
+    pre-printed rows read as letters, and must not be reported as teachers."""
+    assert ocr_form6._listed_name(text) == name
+
+
+def test_hours_are_left_out_of_the_description_when_the_credits_were_refused_for_them():
+    """SO 1891 row 7: "1 hrs" for a teacher who worked 71 would otherwise go to HRIS."""
+    [row] = _vsc_row_from({"name": "JOAQUIN, DISA L.", "dates": "May 4-29, 2026", "hours": "1", "credits": "13.319"})
+    assert row.earned == "" and "hrs" not in row.description
+    [fine] = _vsc_row_from({"name": "MAGALSO, DENNIS M.", "dates": "May 4-29, 2026", "hours": "98", "credits": "18.375"})
+    assert fine.earned == "18.375" and "(98 hrs)" in fine.description
+
+
+def test_a_lone_digit_is_told_from_a_number_under_a_pen_stroke():
+    """Only a lone digit is read cropped to it: "6.299" read that way as "6" would be wrong."""
+    import cv2
+    lone = np.full((90, 300, 3), 235, dtype=np.uint8)
+    cv2.putText(lone, "5", (140, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (40, 40, 40), 3)
+    many = np.full((90, 300, 3), 235, dtype=np.uint8)
+    cv2.putText(many, "6.299", (80, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (40, 40, 40), 3)
+    assert ocr_form6._glyph_count(lone, (0, 0, 300, 90)) == 1
+    assert ocr_form6._glyph_count(many, (0, 0, 300, 90)) >= 4
+
+
+# --- SO 1893: hidden "-do-" cells, page layout carried over, two-pass reads --
+
+def _ditto_row_above():
+    """A clean row whose hours, credits and dates were all "-do-"."""
+    return ocr_form6.Form6Row("8", "Miso", "Czarina", "", "Teacher", "June 1-4, 2026", "", "VSC", "",
+                              date_from="2026-06-01", date_to="2026-06-04", kind="vsc", hours=32, earned="6",
+                              in_scope=True, inherited=("credits", "dates", "hours"))
+
+
+def test_a_ditto_cell_hidden_by_a_pen_mark_is_taken_from_above_but_not_ticked():
+    """SO 1893 rows 29-31: a signature runs down the dates column, whose cells
+    read as "" or "-" instead of "-do-". In a "-do-" column the row above is the
+    answer, but it was never seen, so the row isn't ticked."""
+    [row] = _vsc_row_from({"name": "DORIA, LILIBETH Q.", "dates": "-", "hours": "-do-", "credits": "-do-"},
+                          previous=_ditto_row_above())
+    assert (row.date_from, row.date_to, row.hours, row.earned) == ("2026-06-01", "2026-06-04", 32, "6")
+    assert "hidden by a pen mark" in row.parse_warning
+    assert not row.in_scope
+
+
+def test_a_blank_cell_is_not_inherited_outside_a_ditto_column():
+    above = _ditto_row_above()
+    above = ocr_form6.Form6Row(**{**above.__dict__, "inherited": ()})
+    [row] = _vsc_row_from({"name": "DORIA, LILIBETH Q.", "dates": "", "hours": "32", "credits": "6"}, previous=above)
+    assert row.date_from is None and not row.in_scope
+
+
+def test_stray_digits_for_ditto_hours_give_way_to_the_row_above():
+    """SO 1893 row 11: "-do-" under a pen mark read as "4" hours — and 6 credits
+    can't come from 4 hours. The credits match the row above; the hours are the misread."""
+    [row] = _vsc_row_from({"name": "PARAISO, JACKELINE C.", "dates": "-do-", "hours": "4", "credits": "-do-"},
+                          previous=_ditto_row_above())
+    assert row.hours == 32 and row.earned == "6"
+    assert "misread under a pen mark" in row.parse_warning and not row.in_scope
+
+
+def test_a_row_with_no_dates_is_never_ticked():
+    [row] = _vsc_row_from({"name": "TAN, KAREN M.", "dates": "--", "hours": "32", "credits": "6"})
+    assert row.date_from is None and not row.in_scope
+
+
+def test_row_numbers_that_go_backwards_within_an_order_are_renumbered():
+    def grant(no, event="Training"):
+        return ocr_form6.Form6Row(no, "X", "Y", "", "", "", "", "VSC", "", kind="vsc", event=event)
+    rows = [grant("49"), grant("30"), grant("1"), grant("2"), grant("06"), grant("58")]
+    ocr_form6._enforce_increasing_numbers(rows)
+    assert [r.row_no for r in rows] == ["49", "50", "51", "52", "53", "58"]
+    # Two orders in one PDF each start at 1: left alone.
+    two = [grant("1", "A"), grant("2", "A"), grant("1", "B"), grant("2", "B")]
+    ocr_form6._enforce_increasing_numbers(two)
+    assert [r.row_no for r in two] == ["1", "2", "1", "2"]
+
+
+def test_a_school_column_beside_the_name_is_not_read_as_part_of_it():
+    columns = [["13", "15", "17"], ["EVELYN C. ALERIA", "ANGELA MAE H. BAYAWA", "DARWIN D. ESTOQUE"],
+               ["BUGO NHS", "TABLON NHS", "PUERTO NHS"], ["Teacher", "-do-", "-do-"],
+               ["June 1-4, 2026", "-do-", "-do-"], ["32", "-do-", "-do-"], ["6", "-do-", "-do-"]]
+    labels = ocr_form6._labels_from_samples(columns)
+    assert labels[1] == "name" and labels[2] is None
+
+
+def test_a_continuation_page_of_ditto_columns_uses_the_first_pages_layout():
+    grid = [(0, 100), (100, 400), (400, 600), (600, 700), (700, 900), (900, 1000), (1000, 1100)]
+    labels = ["no", "name", None, "position", "dates", "hours", "credits"]
+    header = ocr_form6._header_from_labels(labels, grid)
+    assert ocr_form6._labels_of(header, grid) == labels
+    assert ocr_form6._doubtful(None, grid)
+    assert ocr_form6._doubtful(ocr_form6._header_from_labels(["no", "name", "name", None, "dates", None, None], grid), grid)
+    assert not ocr_form6._doubtful(header, grid)
+
+
+def test_rows_are_rebuilt_from_the_number_column_when_the_grid_falls_apart():
+    """SO 1893 page 4: a signature across the rows cuts the cells into fragments."""
+    grid = [(0, 100), (100, 400), (400, 600)]
+    boxes = [(2, 0, 96, 80), (2, 85, 96, 60), (2, 86, 96, 59), (150, 90, 30, 40), (2, 150, 96, 80), (420, 20, 30, 30)]
+    rows = ocr_form6._rebuild_rows(boxes, grid)
+    assert [(r[0][1], r[0][3]) for r in rows] == [(0, 80), (85, 60), (150, 80)]
+    assert all(len(r) == 3 and r[2] == (400, r[0][1], 200, r[0][3]) for r in rows)
+
+
+def test_two_readings_of_a_page_that_disagree_are_flagged():
+    """SO 1892 row 49: "5" unreadable as scanned, read "3" once straightened."""
+    def grant(no, name, earned, df="2026-06-01", dt="2026-06-05", hours=40):
+        return ocr_form6.Form6Row(no, name, "Y", "", "", "", "", "VSC", "", date_from=df, date_to=dt,
+                                  kind="vsc", hours=hours, earned=earned, in_scope=True)
+    kept = [grant("48", "Salolog", "5"), grant("49", "Sialana", "3"), grant("50", "Soliano", "5")]
+    other = [grant("48", "Salolog", "5"), grant("49", "Sialana", ""), grant("50", "Soliano", "4")]
+    ocr_form6._flag_passes_that_disagree(kept, other)
+    assert [r.in_scope for r in kept] == [True, True, False]          # an unread figure isn't a disagreement
+    assert "disagree on the credits (5 or 4)" in kept[2].parse_warning
+
+
+# --- SO 1898: pen strokes over credits, rows unlike their order, page footers --
+
+def test_a_pen_stroke_through_the_credits_leaves_them_unread():
+    """SO 1898 row 27, Gabitano: a "6" crossed by the signature read as "2" on
+    every pass — under what 32 hours can earn, so nothing refused it."""
+    credits_box = (30, 0, 10, 10)
+    with patch.object(ocr_form6, "_has_pen_stroke", lambda img, boxes: boxes == [credits_box]):
+        [row] = _vsc_row_from(
+            {"name": "GABITANO, FAITH DYAN C.", "dates": "June 1-4, 2026", "hours": "32", "credits": "2"},
+            img=np.zeros((10, 10, 3), dtype=np.uint8),
+        )
+    assert row.earned == "" and not row.in_scope
+    assert "pen mark crosses the credits cell" in row.parse_warning
+    assert row.hours == 32 and "(32 hrs)" in row.description
+
+
+
+def test_a_figure_the_hours_earn_exactly_is_kept_under_a_pen_stroke():
+    """Pedro Roa rows 12-15: the signature runs down the credits column beside a
+    clean "22.56" — 120 hours at 0.188. No misread lands on that by chance."""
+    credits_box = (30, 0, 10, 10)
+    with patch.object(ocr_form6, "_has_pen_stroke", lambda img, boxes: boxes == [credits_box]):
+        [row] = _vsc_row_from(
+            {"name": "EPARWA, DYESEBEL", "dates": "May 6 - June 2, 2026", "hours": "120", "credits": "22.56"},
+            img=np.zeros((10, 10, 3), dtype=np.uint8),
+        )
+    assert row.earned == "22.56" and row.in_scope and row.parse_warning is None
+
+
+def _order_row(hours, earned, event="Grade 9 training", no="1"):
+    return ocr_form6.Form6Row(no, "X", "Y", "", "", "", "", "VSC", "", date_from="2026-06-01",
+                              date_to="2026-06-04", kind="vsc", hours=hours, earned=earned,
+                              in_scope=True, event=event)
+
+
+def test_a_row_unlike_the_rest_of_its_order_is_flagged_and_unticked():
+    """SO 1898: 32 hrs for 6 credits on 109 of 111 rows. Aniñon read 32 for 2,
+    and Aluro 34 for 6 — each believable alone, each ticked for submission."""
+    usual = [_order_row(32, "6") for _ in range(6)]
+    two_credits, more_hours = _order_row(32, "2"), _order_row(34, "6")
+    shorter, unread = _order_row(24, "4.5"), _order_row(None, "6")      # a different grant; hours not read
+    rows = usual + [two_credits, more_hours, shorter, unread]
+    ocr_form6._flag_rows_unlike_their_order(rows)
+    assert not two_credits.in_scope and "reads 32 hrs for 2" in two_credits.parse_warning
+    assert not more_hours.in_scope and "reads 34 hrs for 6" in more_hours.parse_warning
+    assert all(r.in_scope and r.parse_warning is None for r in usual + [shorter, unread])
+    assert all(r.earned in ("2", "6") for r in (two_credits, more_hours))    # flagged, never changed
+
+
+def test_an_order_without_a_clear_norm_is_left_alone():
+    few = [_order_row(32, "6") for _ in range(4)] + [_order_row(32, "2")]         # too few rows to set a norm
+    ocr_form6._flag_rows_unlike_their_order(few)
+    # Offices below the formula by varying amounts: no pair is most of the order.
+    varied = [_order_row(h, c) for h, c in [(30.217, "5.575"), (31.617, "5.732"), (32, "6"), (32, "6"),
+                                         (32, "6"), (32, "5.9"), (28, "5"), (40, "7.5")]]
+    ocr_form6._flag_rows_unlike_their_order(varied)
+    assert all(r.in_scope and r.parse_warning is None for r in few + varied)
+
+
+def test_an_office_granting_below_the_formula_may_give_the_same_credits_for_other_hours():
+    """SO 1892 (East Gusa) grants 5 for 40 hours — below the formula's 7.5 — and
+    the paper gives Paican, June 1-4, 5 for 32. Sialana's 40 for 3 was a misread."""
+    usual = [_order_row(40, "5") for _ in range(6)]
+    paican, sialana = _order_row(32, "5"), _order_row(40, "3")
+    ocr_form6._flag_rows_unlike_their_order(usual + [paican, sialana])
+    assert paican.in_scope and paican.parse_warning is None
+    assert not sialana.in_scope and "reads 40 hrs for 3" in sialana.parse_warning
+
+
+def test_one_orders_norm_does_not_judge_another():
+    rows = [_order_row(32, "6", "Grade 9") for _ in range(6)] + [_order_row(32, "5", "Aral Program")]
+    ocr_form6._flag_rows_unlike_their_order(rows)
+    assert all(r.in_scope for r in rows)
+
+
+# SO 1898 page 1, dewarped: the table's columns, and rows as the grid finder saw them.
+_SO1898_GRID = [(6, 121), (126, 621), (626, 985), (990, 1302), (1306, 1592), (1596, 1788), (1792, 2021)]
+
+
+def test_the_page_footer_joined_to_the_table_by_a_pen_line_is_not_a_row():
+    """The "Doc. Ref. Code | Rev" box read as a teacher named "Eit Iedh Tan
+    Ig I", pushing every row number after it up by two."""
+    footer = [(1458, 1746, 199, 32), (1662, 1745, 93, 33), (1764, 1745, 115, 33),
+              (1884, 1746, 76, 32), (1964, 1746, 86, 32)]
+    assert not ocr_form6._sits_on_grid(footer, _SO1898_GRID)
+
+
+def test_real_rows_sit_on_the_grid_even_when_cut_or_merged():
+    row_10 = [(6, 1335, 115, 117), (126, 1335, 495, 117), (626, 1335, 358, 117), (990, 1335, 311, 118),
+              (1306, 1335, 285, 118), (1596, 1335, 156, 118), (1759, 1335, 28, 118),   # hours split by the pen line
+              (1792, 1335, 228, 118)]
+    short = [(6, 252, 114, 108), (125, 253, 496, 107), (1792, 253, 229, 108)]
+    spanning = [(6, 5, 1586, 243), (1596, 5, 425, 243)]
+    for row in (row_10, short, spanning):
+        assert ocr_form6._sits_on_grid(row, _SO1898_GRID)
+
+
+# --- SO 1905: a day number broken by the cell's wrap, lone digits read cropped --
+
+def test_a_day_number_broken_by_the_cells_line_wrap_is_rejoined():
+    """SO 1905 rows 1-2: seventeen days in a narrow cell, "...28,2" / "9, 2026"."""
+    raw = "May 6,7,8,11,12,13,14,15,18 ,19,20,21,22,25,26,28,2 9, 2026"
+    assert ocr_form6._period_from_dates(raw, 2026) == ("2026-05-06", "2026-05-29", None)
+
+
+@pytest.mark.parametrize("raw", [
+    "May 1,2 9, 2026",       # 2 continues the list: two days, not a broken 29
+    "May 6, 7, 8, 2026",     # spaced commas are separators
+])
+def test_days_that_continue_the_list_are_not_joined(raw):
+    assert ocr_form6._join_wrapped_days(raw) == raw
+
+
+def _cell_with(text, speck=False):
+    import cv2
+    cell = np.full((95, 190, 3), 235, dtype=np.uint8)
+    cv2.putText(cell, text, (70, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (40, 40, 40), 3)
+    if speck:
+        cv2.circle(cell, (170, 80), 5, (40, 40, 40), -1)     # a blot far from the digit
+    return cell
+
+
+def _cropped_digits(cell):
+    """The images _lone_digit_reads hands Tesseract, less their 20px border."""
+    seen = []
+    with patch.object(ocr_form6, "_run_tesseract", lambda img, psm, wl: seen.append(img) or "5"):
+        reads = ocr_form6._lone_digit_reads(cell, (0, 0, 190, 95))
+    return reads, [img[20:-20, 20:-20] for img in seen]
+
+
+def test_a_lone_digit_is_read_cropped_to_its_ink():
+    """SO 1905: a clean "5" alone in a tall, wide cell read blank, "9" or "8"
+    whole. Each read gets the digit alone, at a set height."""
+    reads, crops = _cropped_digits(_cell_with("5"))
+    assert reads == ["5", "5", "5"]
+    assert sorted(c.shape[0] for c in crops) == [36, 50, 50]
+    assert all(c.shape[1] < c.shape[0] for c in crops)        # a digit's width, not the cell's
+
+
+def test_a_mark_away_from_the_digit_is_left_out_of_the_crop():
+    _, alone = _cropped_digits(_cell_with("5"))
+    _, blotted = _cropped_digits(_cell_with("5", speck=True))
+    assert [c.shape for c in blotted] == [c.shape for c in alone]
+
+
+def test_the_point_of_a_half_is_kept_in_the_crop():
+    """Kauswagan prints ".5": the point is too small to count as a digit, but
+    cropped away it would read as 5."""
+    _, five = _cropped_digits(_cell_with("5"))
+    _, half = _cropped_digits(_cell_with(".5"))
+    assert half[0].shape[1] > five[0].shape[1]
+
+
+def test_a_one_digit_credits_cell_uses_the_cropped_reads():
+    with patch.object(ocr_form6, "_glyph_count", lambda img, box, pad=6: 1), \
+         patch.object(ocr_form6, "_lone_digit_reads", lambda img, box: ["5", "5", "5"]):
+        [row] = _vsc_row_from(
+            {"name": "EMBATE, EMMANUEL JR. B.", "dates": "May 6,11,18,25,30, 2026", "hours": "40", "credits": ""},
+            img=np.zeros((10, 10, 3), dtype=np.uint8),
+        )
+    assert row.earned == "5" and row.parse_warning is None and row.in_scope
+
+
+# --- SO 1849: numbers read at the size Tesseract reads best ------------------
+
+def test_scaled_credits_are_taken_when_the_whole_cell_reads_are_impossible():
+    """SO 1849 row 2: 5.252 for 28 hours, read whole as 9.2902 and 9.292."""
+    old = [9.2902, 9.2902, 9.292]
+    printed, warning = ocr_form6._consensus_credits(["9.2902", "9.2902", "9.292"], ocr_form6.vsc_ceiling(28))
+    assert ocr_form6._settle_credits(old, printed, warning, 5.252, ocr_form6.vsc_ceiling(28)) == (5.252, None)
+
+
+def test_scaled_credits_are_taken_when_nothing_else_read():
+    assert ocr_form6._settle_credits([None, None, None], None, None, 7.5, ocr_form6.vsc_ceiling(40)) == (7.5, None)
+
+
+def test_two_believable_credit_readings_that_disagree_are_left_blank():
+    """SO 1849 row 25, Morata: 5.202 whole, 5.252 scaled — both under 28 hours' ceiling."""
+    value, warning = ocr_form6._settle_credits([None, 5.202, None], 5.202, None, 5.252, ocr_form6.vsc_ceiling(28))
+    assert value is None and "5.252 or 5.202" in warning
+
+
+def test_a_scaled_reading_above_the_hours_changes_nothing():
+    assert ocr_form6._settle_credits([3.0, 3.0, 3.0], 3.0, None, 13.0, ocr_form6.vsc_ceiling(16)) == (3.0, None)
+
+
+def test_scaled_credits_agreeing_with_the_whole_cell_majority_settle_it():
+    """SO 1891's Magalso, 18.375 for 98 hours: whole-cell reads 18.375, 18.379, 18.375."""
+    old = [18.375, 18.379, 18.375]
+    printed, warning = ocr_form6._consensus_credits(["18.375", "18.379", "18.375"], ocr_form6.vsc_ceiling(98))
+    assert warning and ocr_form6._settle_credits(old, printed, warning, 18.375, ocr_form6.vsc_ceiling(98)) == (18.375, None)
+
+
+def test_the_order_period_bounds_the_hours():
+    assert ocr_form6._most_hours(("2026-06-01", "2026-06-05")) == 120
+    assert ocr_form6._most_hours(None) is None
+
+
+@pytest.mark.parametrize("hours,digit_reads,scaled,most,expected", [
+    (395, (395, None), 35, 120, (35, None)),           # SO 1849 Salcedo: more hours than five days hold
+    (None, (None, None), 27, 120, (27, None)),         # SO 1849 Sagosoy: read whole as "at"
+    (2, (21, 27), 27, 120, (27, None)),                # SO 1849 Jugalbot: one whole-cell read agrees
+    (90.97, (90.97, 90.97), 50.97, None, (None, "90.97 or 50.97")),   # SO 1896 Dubria: both believable
+    (40, (40, 40), 40, 120, (40, None)),
+    (40, (40, 40), None, 120, (40, None)),             # no scaled agreement: nothing changes
+    (40, (40, 40), 400, 120, (40, None)),              # an impossible scaled read changes nothing
+])
+def test_scaled_hours_settle(hours, digit_reads, scaled, most, expected):
+    assert ocr_form6._settle_hours(hours, digit_reads, scaled, most) == expected
+
+
+def test_disputed_hours_are_left_out_and_the_row_unticked():
+    with patch.object(ocr_form6, "_scaled_reads", lambda img, boxes, wl: ["50.97", "50.97"] if "," not in wl else []):
+        [row] = _vsc_row_from({"name": "DUBRIA, ANA", "dates": "May 6 - June 2, 2026", "hours": "90.97", "credits": "10"})
+    assert row.hours is None and "hrs" not in row.description
+    assert "disagreed on the hours served (90.97 or 50.97)" in row.parse_warning
+    assert row.earned == "10" and not row.in_scope
+
+
+def _number_cell(text):
+    import cv2
+    cell = np.full((190, 250, 3), 255, dtype=np.uint8)
+    cv2.putText(cell, text, (60, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (110, 110, 110), 1)     # small, thin and pale
+    return cell
+
+
+def test_a_number_is_cropped_close_and_read_at_two_heights():
+    seen = []
+    with patch.object(ocr_form6, "_run_tesseract", lambda img, psm, wl: seen.append(img) or "5.252"):
+        assert ocr_form6._scaled_reads(_number_cell("5.252"), [(0, 0, 250, 190)], "0123456789.,") == ["5.252", "5.252"]
+    assert [img.shape[0] - 40 for img in seen] == [24, 32]
+    assert all(img.shape[1] > img.shape[0] for img in seen)        # the number's shape, not the tall cell's
+
+
+def test_a_cell_split_by_a_pen_stroke_gets_no_scaled_reads():
+    assert ocr_form6._scaled_reads(_number_cell("5.252"), [(0, 0, 120, 190), (120, 0, 130, 190)], "0123456789.,") == []
+
+
+def test_a_ditto_cell_read_as_zero_is_not_a_scaled_value():
+    assert ocr_form6._agreed(["0", "0."], ocr_form6._normalize_credits) is None
+    assert ocr_form6._agreed(["5.252", "5.252"], ocr_form6._normalize_credits) == 5.252
+    assert ocr_form6._agreed(["5.252", "9.252"], ocr_form6._normalize_credits) is None
+
+
+# ---------------------------------------------------------------------------
+# SO 2159 (Cagayan de Oro NHS Junior High, Annex D): numeric day lists with no
+# year, a signature in blue across four rows, thin serif figures, and grants
+# above the x1.50 formula.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    # The year is only in the paragraph; the days change month part way.
+    ("5/6-8,11-15,18- 22,25,26,28,29, 6/1,2", ("2026-05-06", "2026-06-02")),
+    ("5/7,8,11- 15,18,22,25,26,28,29", ("2026-05-07", "2026-05-29")),
+    # The space before the next month lost: "29 6/1,2" read as "296/1,2".
+    ("5/6-8,11-15,18- 22,25,26,28,296/1,2", ("2026-05-06", "2026-06-02")),
+    # "to" and an en dash are the range, not noise to strip.
+    ("5/6to6/2/2026", ("2026-05-06", "2026-06-02")),
+    ("5/6 – 6/2/2026", ("2026-05-06", "2026-06-02")),
+])
+def test_numeric_day_lists_with_no_year(raw, expected):
+    assert ocr_form6._period_from_dates(raw, 2026)[:2] == expected
+
+
+def test_days_after_a_month_change_are_that_months():
+    segments, warning = ocr_form6._parse_date_segments_numeric("5/28,29,6/1,2/2026")
+    assert warning is None
+    assert segments[-1] == (ocr_form6.date(2026, 6, 2), ocr_form6.date(2026, 6, 2))
+
+
+def test_a_to_between_dates_survives_the_digits_reread():
+    whitelists = []
+
+    def fake_ocr(img, box, psm, wl, pad=4):
+        whitelists.append(wl)
+        return "56 to 62)2026" if len(whitelists) == 1 else "5/6to6/2/2026"
+
+    with patch.object(ocr_form6, "_ocr_cell", fake_ocr):
+        text, _ = ocr_form6._ocr_date_cell(None, (0, 0, 10, 10))
+    assert "to" in whitelists[1] and text == "5/6to6/2/2026"
+
+
+_SO2159_TOP = (
+    "SPECIAL ORDER FOR VACATION SERVICE CREDITS Date: July 7, 2026 SPECIAL ORDER SS No. 2159 s. 2026 "
+    "The teacher/s of CAGAYAN DE ORO NATIONAL HIGH SCHOOL JUNIOR HIGH is hereby granted vacation service "
+    "credits for services rendered during the 2026 SUMMER REMEDIATION PROGRAMS (SRP) May 6 to June 2, 2026."
+)
+
+
+def test_a_period_with_no_on_or_from_and_a_title_before_it():
+    """The title says "service credits" before the order's date line — which
+    read as the period (July 7) — and the period itself has no "on"/"from"."""
+    assert ocr_form6._period_from_text(_SO2159_TOP, 2026) == ("2026-05-06", "2026-06-02")
+    assert ocr_form6._event_from_text(_SO2159_TOP) == "2026 Summer Remediation Programs (SRP)"
+
+
+def test_a_word_that_isnt_a_month_doesnt_start_a_period():
+    assert ocr_form6._period_from_text("services rendered during ANNEX 2 activities", 2026) is None
+
+
+def test_a_confirmed_grant_above_the_formula_is_filled_in_with_a_warning():
+    earned, warning = ocr_form6._resolve_vsc_credits_unbounded(114, 28.5, confirmed=True)
+    assert earned == 28.5 and "not ticked" in warning
+    # Unconfirmed, it is refused as before; confirmed, a lost decimal still is.
+    assert ocr_form6._resolve_vsc_credits_unbounded(114, 28.5)[0] is None
+    assert ocr_form6._resolve_vsc_credits_unbounded(114, 285, confirmed=True)[0] is None
+
+
+def _so2159_row(credits_whole, close_up, thick, hours="114"):
+    def scaled(img, boxes, wl):
+        return [close_up, close_up] if "," in wl else [hours, hours]
+
+    def thick_read(img, boxes, wl):
+        return thick if "," in wl else hours
+
+    with patch.object(ocr_form6, "_scaled_reads", scaled), patch.object(ocr_form6, "_thick_read", thick_read):
+        [row] = _vsc_row_from({"name": "ALILIN, JOYLEN A", "dates": "5/6 - 6/2/2026", "hours": hours,
+                                "credits": credits_whole})
+    return row
+
+
+def test_two_other_ways_of_reading_outvote_the_whole_cell_reads():
+    """SO 2159's thin 5 reads as 9 across the whole cell; close up and with
+    thickened strokes it reads right."""
+    row = _so2159_row("28.9", "28.5", "28.5")
+    assert row.earned == "28.5" and not row.in_scope       # above x1.50: shown, never ticked
+    # A whole-cell reading the hours also allow is a believable rival: flagged.
+    row = _so2159_row("5.9", "5.5", "5.5", hours="40")
+    assert row.earned == "5.5" and not row.in_scope
+    assert "5.5 close up and 5.9 across the whole cell" in row.parse_warning
+
+
+def test_a_grant_above_the_formula_is_shown_but_not_ticked():
+    row = _so2159_row("28.5", "28.5", "28.5")
+    assert row.earned == "28.5" and row.hours == 114
+    assert not row.in_scope and row.trusted
+    assert "more than 114 hours earn at x1.50" in row.parse_warning
+
+
+def test_without_agreement_the_formula_still_refuses():
+    row = _so2159_row("28.9", "28.5", "")
+    assert row.earned == "" and not row.in_scope
+
+
+def test_the_credits_settle_disputed_hours_only_at_the_formula():
+    assert ocr_form6._earns_as_printed(75, 14.06)          # 14.0625 to the cent
+    assert not ocr_form6._earns_as_printed(79, 14.06)
+    assert ocr_form6._earns_as_printed(100, 18.75)
+    assert not ocr_form6._earns_as_printed(114, 28.5)
+
+
+def _page_with_pen(blue=(200, 60, 20)):
+    import cv2
+    page = np.full((120, 200, 3), 255, dtype=np.uint8)
+    cv2.line(page, (0, 60), (199, 60), (0, 0, 0), 2)                 # a row's rule
+    cv2.putText(page, "28.5", (40, 45), cv2.FONT_HERSHEY_SIMPLEX, 1, (20, 20, 20), 2)
+    cv2.line(page, (120, 0), (130, 119), blue, 4)                     # a signature's downstroke
+    return page
+
+
+def test_blue_pen_ink_is_removed_and_print_kept():
+    page = _page_with_pen()
+    clean = ocr_form6._drop_pen_ink(page)
+    b, r = clean[..., 0].astype(int), clean[..., 2].astype(int)
+    assert not ((b - r) > 50).any()                                   # no blue left
+    assert (clean[30:50, 40:110] < 100).any()                         # the figure survives
+    assert (clean[60, 125] == 255).all()                              # the crossing went too...
+    rules = ocr_form6._drop_pen_ink(page, keep_rules=True)
+    assert (rules[60, 125] == 0).all()                                # ...unless rules are kept
+
+
+def test_a_page_with_no_colour_is_unchanged():
+    page = _page_with_pen(blue=(40, 40, 40))
+    assert ocr_form6._drop_pen_ink(page) is page
+
+
+def _position_cell(numerals):
+    import cv2
+    cell = np.full((80, 160, 3), 255, dtype=np.uint8)
+    cv2.rectangle(cell, (20, 15), (50, 20), (0, 0, 0), -1)            # the T's bar
+    cv2.rectangle(cell, (33, 15), (37, 60), (0, 0, 0), -1)            # its stem
+    for i in range(numerals):
+        x = 60 + 14 * i
+        cv2.rectangle(cell, (x, 15), (x + 4, 60), (0, 0, 0), -1)
+        cv2.rectangle(cell, (x - 5, 15), (x + 9, 18), (0, 0, 0), -1)  # serifs that touch the next I
+        cv2.rectangle(cell, (x - 5, 57), (x + 9, 60), (0, 0, 0), -1)
+    return cell
+
+
+@pytest.mark.parametrize("numerals", [1, 2, 3])
+def test_a_positions_numeral_is_counted_by_its_strokes(numerals):
+    assert ocr_form6._count_stems(_position_cell(numerals), (0, 0, 160, 80)) == numerals + 1
+
+
+def test_the_column_split_on_the_first_page_is_remembered():
+    before = [(0, 100), (100, 400), (400, 900)]
+    after = [(0, 100), (100, 400), (400, 650), (650, 900)]
+    assert ocr_form6._split_columns(before, after) == [2]
+    assert ocr_form6._split_columns(before, before) == []
+
+
+def test_a_name_with_no_comma_reads_like_the_rest_of_its_order():
+    rows = [
+        ocr_form6.Form6Row("1", "Abella", "Jeffry", "Q.", "", "", "", "VSC", "", kind="vsc", name_raw="ABELLA, JEFFRY Q."),
+        ocr_form6.Form6Row("2", "Adaya", "Kristine", "L.", "", "", "", "VSC", "", kind="vsc", name_raw="ADAYA, KRISTINE L."),
+        ocr_form6.Form6Row("3", "Omar", "Asnorah", "M.", "", "", "", "VSC", "", kind="vsc", name_raw="OMAR, ASNORAH M."),
+        ocr_form6.Form6Row("4", "Philip", "Olarte Roy", "", "", "", "", "VSC", "", kind="vsc", name_raw="OLARTE ROY PHILIP"),
+    ]
+    notes = ocr_form6._surname_first_like_the_rest(rows)
+    assert (rows[3].last_name, rows[3].first_name) == ("Olarte", "Roy Philip")
+    assert len(notes) == 1 and "OLARTE ROY PHILIP" in notes[0]
+
+
+def test_a_first_name_first_order_is_left_alone():
+    rows = [ocr_form6.Form6Row(str(i), "Conde", "Kenneth", "", "", "", "", "VSC", "", kind="vsc",
+                               name_raw="Kenneth Joh Conde") for i in range(4)]
+    assert ocr_form6._surname_first_like_the_rest(rows) == []
+    assert rows[0].last_name == "Conde"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("OLARTE ROY PHILIP", ("Olarte", "Roy Philip", "")),
+    ("DELA VEGA. ARA NICOLE BACONG", ("Dela Vega", "Ara Nicole Bacong", "")),   # SO 1892: a period for the comma
+    ("PANAL REVERIANO JR. PUTI-AN", ("Panal", "Reveriano Jr. Puti-An", "")),   # "JR." is no comma
+    ("DE LOS SANTOS JUAN A.", ("De Los Santos", "Juan", "A.")),
+])
+def test_a_comma_less_surname_first_name(raw, expected):
+    assert ocr_form6._split_combined_name(ocr_form6._surname_comma(raw.split())) == expected
+
+
+def test_table_header_text_is_never_the_event():
+    """SO 1849's page 6 OCR'd its paragraph out of order: what followed
+    "during" was the table's header, up to the first row's "June 1-5"."""
+    text = ("granted vacation services rendered during the 2026 Brigada Eskwela No. of Inclusive No. of Vacation "
+            "No. Name Position Dates Hours Service Served Credits Granted YANA, JUDY ANN C. T21. June 1-5, 2026 7 1.313")
+    assert ocr_form6._event_from_text(text) == ""
